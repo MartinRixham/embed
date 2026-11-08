@@ -9,14 +9,14 @@
    Each file is turned into a short text description (its name,
    location, type and, where possible, its content: plain text, PDF
    text, office document text, OCR of images, or audio/video metadata)
-   and that text is embedded by a model running on the GPU in a private
-   Ollama server that this program starts and stops itself.  The results are
-   appended to ~/.local/share/embed/embeddings.txt, one file per line.
+   and that text is embedded by nomic-embed-text, running on the GPU if
+   there is a usable one.  The results are appended to
+   ~/.local/share/embed/embeddings.txt, one file per line.
    Files whose size and modification time are unchanged since the last
    run are skipped, so the program can be rerun cheaply.  */
 
 #include "common.h"
-#include "server.h"
+#include "model.h"
 
 #include <errno.h>
 #include <error.h>
@@ -34,9 +34,6 @@
 
 /* How much file content to feed the model, in bytes.  */
 #define MAX_CONTENT 1500
-
-/* Time limit for embedding just a file's name and type, in seconds.  */
-#define FALLBACK_TIMEOUT 2
 
 /* An entry loaded from an existing store.  */
 struct entry
@@ -62,13 +59,12 @@ static bool store_unterminated;
 static volatile sig_atomic_t interrupted;
 static bool verbose;
 static bool include_hidden;
+static bool use_cpu;
 static long helper_timeout = 2;
-static long embed_timeout = 4;
 
 static struct option const long_options[] = {
   {"all", no_argument, NULL, 'a'},
-  {"host", required_argument, NULL, 'H'},
-  {"timeout", required_argument, NULL, 't'},
+  {"cpu", no_argument, NULL, 'c'},
   {"verbose", no_argument, NULL, 'v'},
   {"help", no_argument, NULL, 'h'},
   {"version", no_argument, NULL, 'V'},
@@ -87,16 +83,13 @@ usage (int status)
           "Embed every file under each DIRECTORY (default: $HOME) with "
           "the local\nmodel %s, which is downloaded if it is missing.\n\n"
           "  -a, --all            include hidden files and directories\n"
-          "  -H, --host=URL       use the Ollama server at URL instead of "
-          "starting\n"
-          "                       a private one on the GPU\n"
-          "  -t, --timeout=SECS   time limit for each embedding (default "
-          "%ld)\n"
+          "      --cpu            run the model on the CPU even if there is "
+          "a GPU\n"
           "  -v, --verbose        print each file as it is embedded\n"
           "      --help           display this help and exit\n"
           "      --version        output version information and exit\n\n"
           "Embeddings are stored in ~/.local/share/embed/embeddings.txt.\n",
-          EMBED_MODEL, embed_timeout);
+          EMBED_MODEL);
   exit (status);
 }
 
@@ -422,8 +415,7 @@ extract_content (const char *file, const char *mime, struct buf *out)
    used to shorten the displayed location.  */
 static void
 describe_file (magic_t magic_mime, magic_t magic_desc, const char *file,
-               const char *home, const char *model, bool with_content,
-               struct buf *out)
+               const char *home, bool with_content, struct buf *out)
 {
   const char *name = strrchr (file, '/');
   const char *mime = magic_file (magic_mime, file);
@@ -431,7 +423,7 @@ describe_file (magic_t magic_mime, magic_t magic_desc, const char *file,
   size_t home_len = strlen (home);
 
   name = name ? name + 1 : file;
-  buf_puts (out, document_prefix (model));
+  buf_puts (out, DOCUMENT_PREFIX);
   buf_puts (out, "File name: ");
   buf_puts (out, name);
   buf_puts (out, "\nLocation: ");
@@ -454,20 +446,18 @@ describe_file (magic_t magic_mime, magic_t magic_desc, const char *file,
     }
 }
 
-/* Embed TEXT like embed_text, but fail unless the vector has DIM
+/* Embed TEXT like model_embed, but fail unless the vector has DIM
    dimensions, so that the store stays consistent.  */
 static bool
-embed_checked (struct embedder *e, const char *text, long timeout,
-               size_t dim, float **vec)
+embed_checked (struct model *m, const char *text, size_t dim, float **vec)
 {
   size_t d;
 
-  if (!embed_text (e, text, timeout, vec, &d))
+  if (!model_embed (m, text, vec, &d))
     return false;
   if (d == dim)
     return true;
-  if (embed_report_errors)
-    error (0, 0, "model returned %zu dimensions instead of %zu", d, dim);
+  error (0, 0, "model returned %zu dimensions instead of %zu", d, dim);
   free (*vec);
   return false;
 }
@@ -538,15 +528,13 @@ compact_store (const char *path)
 int
 main (int argc, char **argv)
 {
-  const char *host = NULL;
-  struct server srv = { 0 };
   char store_model[256];
   char *store = store_path ();
   char *store_dir;
   const char *home = getenv ("HOME");
   char *default_roots[2];
   char **roots;
-  struct embedder emb;
+  struct model *model;
   magic_t magic_mime, magic_desc;
   FILE *out;
   FTS *fts;
@@ -556,19 +544,15 @@ main (int argc, char **argv)
   bool have_store;
   int c;
 
-  while ((c = getopt_long (argc, argv, "aH:t:v", long_options, NULL))
+  while ((c = getopt_long (argc, argv, "av", long_options, NULL))
          != -1)
     switch (c)
       {
       case 'a':
         include_hidden = true;
         break;
-      case 'H':
-        host = optarg;
-        break;
-      case 't':
-        if (!parse_positive (optarg, 3600, &embed_timeout))
-          error (EXIT_FAILURE, 0, "invalid timeout: %s", optarg);
+      case 'c':
+        use_cpu = true;
         break;
       case 'v':
         verbose = true;
@@ -612,20 +596,15 @@ main (int argc, char **argv)
       n_lines = 0;
     }
 
-  if (!host)
-    {
-      server_start (&srv, true);
-      host = srv.url;
-    }
-  embedder_init (&emb, host, EMBED_MODEL);
-  if (!ensure_model (&emb))
-    error (EXIT_FAILURE, 0, "model %s is unavailable at %s", EMBED_MODEL,
-           host);
+  model = model_open (!use_cpu);
+  if (!model)
+    error (EXIT_FAILURE, 0, "cannot open the %s model", EMBED_MODEL);
+  if (verbose)
+    fprintf (stderr, "embedding on the %s\n", model_device (model));
 
-  /* Warm up the model, which may take a while to load, and learn its
-     dimension.  */
-  if (!embed_text (&emb, "warm up", 120, &vec, &dim))
-    error (EXIT_FAILURE, 0, "cannot load model %s at %s", EMBED_MODEL, host);
+  /* Learn the model's dimension.  */
+  if (!model_embed (model, "warm up", &vec, &dim))
+    error (EXIT_FAILURE, 0, "cannot run the %s model", EMBED_MODEL);
   free (vec);
 
   if (have_store)
@@ -660,7 +639,6 @@ main (int argc, char **argv)
   sigaction (SIGTERM, &sa, NULL);
   signal (SIGPIPE, SIG_IGN);
 
-  embed_report_errors = verbose;
   fts = fts_open (roots, FTS_PHYSICAL | FTS_NOCHDIR, NULL);
   if (!fts)
     error (EXIT_FAILURE, errno, "cannot walk directories");
@@ -701,16 +679,16 @@ main (int argc, char **argv)
         fprintf (stderr, "%s\n", ent->fts_path);
 
       buf_init (&text);
-      describe_file (magic_mime, magic_desc, ent->fts_path, home,
-                     EMBED_MODEL, true, &text);
-      bool ok = embed_checked (&emb, text.data, embed_timeout, dim, &vec);
+      describe_file (magic_mime, magic_desc, ent->fts_path, home, true,
+                     &text);
+      bool ok = embed_checked (model, text.data, dim, &vec);
       if (!ok && !interrupted)
         {
           /* Fall back to embedding just the name and type.  */
           text.len = 0;
           describe_file (magic_mime, magic_desc, ent->fts_path, home,
-                         EMBED_MODEL, false, &text);
-          ok = embed_checked (&emb, text.data, FALLBACK_TIMEOUT, dim, &vec);
+                         false, &text);
+          ok = embed_checked (model, text.data, dim, &vec);
         }
       buf_free (&text);
 
@@ -738,8 +716,7 @@ main (int argc, char **argv)
   if (!verbose && isatty (STDERR_FILENO))
     fputc ('\n', stderr);
   fts_close (fts);
-  embedder_free (&emb);
-  server_stop (&srv);
+  model_close (model);
   if (fclose (out) != 0)
     error (EXIT_FAILURE, errno, "%s", store);
 

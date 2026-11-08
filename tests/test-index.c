@@ -18,7 +18,7 @@
 #include "../embed-index.c"
 #undef main
 
-#include "fake-http.h"
+#include "fake-model.h"
 #include "testutil.h"
 
 #include <check.h>
@@ -27,7 +27,8 @@
 #include <stdarg.h>
 #include <sys/time.h>
 
-/* A temporary home directory and a fake embedding server.  */
+/* A temporary home directory, with the fake model logging what it
+   embeds.  */
 struct fixture
 {
   char *root;                   /* Holds HOME and the test's own files.  */
@@ -36,7 +37,6 @@ struct fixture
   char *log;
   char *out;
   char *err;
-  struct fake fake;
 };
 
 static struct fixture fx;
@@ -52,13 +52,13 @@ setup (void)
   fx.out = path_join (fx.root, "stdout");
   fx.err = path_join (fx.root, "stderr");
   setenv ("HOME", fx.home, 1);
-  fake_start (&fx.fake, fx.log);
+  setenv ("FAKE_MODEL_LOG", fx.log, 1);
+  unsetenv ("FAKE_MODEL");
 }
 
 static void
 teardown (void)
 {
-  fake_stop (&fx.fake);
   tmpdir_remove (fx.root);
 }
 
@@ -77,7 +77,7 @@ put (const char *name, const char *content)
   free (p);
 }
 
-/* Run embed-index against the fake server with the given extra
+/* Run embed-index with the fake model and the given extra
    arguments, ending with NULL.  Return its exit status.  */
 static int
 run_index (const char *arg, ...)
@@ -87,8 +87,6 @@ run_index (const char *arg, ...)
   va_list ap;
 
   argv[argc++] = "embed-index";
-  argv[argc++] = "-H";
-  argv[argc++] = fx.fake.url;
   va_start (ap, arg);
   for (const char *a = arg; a; a = va_arg (ap, const char *))
     argv[argc++] = (char *) a;
@@ -104,10 +102,14 @@ err_text (void)
   return s ? s : strdup ("");
 }
 
+/* Return the number of texts embedded, not counting opening the
+   model.  */
 static size_t
 requests (void)
 {
-  return count_substr (read_file (fx.log), "\n----\n");
+  char *log = read_file (fx.log);
+
+  return count_substr (log, "\n----\n") - count_substr (log, "open gpu=");
 }
 
 /* Return the number of records for HOME/NAME in the store.  */
@@ -355,8 +357,9 @@ START_TEST (test_run_capture_many_calls)
   after = dup (0);
   close (after);
   ck_assert_int_eq (before, after);
-  /* Nothing to reap: only the fake server is left, still running.  */
-  ck_assert_int_eq (waitpid (-1, NULL, WNOHANG), 0);
+  /* Nothing left to reap.  */
+  ck_assert_int_eq (waitpid (-1, NULL, WNOHANG), -1);
+  ck_assert_int_eq (errno, ECHILD);
   buf_free (&b);
 }
 END_TEST
@@ -463,7 +466,11 @@ make_pdf (const char *name, const char *text)
   buf_free (&pdf);
 }
 
-/* Run the shell command FMT in HOME, failing the test if it fails.  */
+/* Run the shell command FMT in HOME, failing the test if it fails.
+   Standard input is /dev/null: Check runs each test in its own
+   process group, so when make check is run from a terminal, a
+   command that touches it (as ffmpeg does, to read keystrokes) is
+   stopped by SIGTTIN or SIGTTOU until the test times out.  */
 static void
 shell (const char *fmt, ...)
 {
@@ -474,7 +481,7 @@ shell (const char *fmt, ...)
   if (vasprintf (&cmd, fmt, ap) < 0)
     abort ();
   va_end (ap);
-  if (asprintf (&full, "cd '%s' && %s", fx.home, cmd) < 0)
+  if (asprintf (&full, "cd '%s' && { %s; } </dev/null", fx.home, cmd) < 0)
     abort ();
   ck_assert_msg (system (full) == 0, "command failed: %s", cmd);
   free (cmd);
@@ -622,13 +629,13 @@ open_magic (void)
 }
 
 static char *
-describe (const char *path, const char *model, bool with_content)
+describe (const char *path, bool with_content)
 {
   struct buf b;
 
   buf_init (&b);
-  describe_file (mime_cookie, desc_cookie, path, fx.home, model,
-                 with_content, &b);
+  describe_file (mime_cookie, desc_cookie, path, fx.home, with_content,
+                 &b);
   return b.data;
 }
 
@@ -638,7 +645,7 @@ START_TEST (test_describe_text_file)
 
   open_magic ();
   put ("Recipes/bread.txt", "Sourdough starter notes\n");
-  d = describe (home_file ("Recipes/bread.txt"), "nomic-embed-text", true);
+  d = describe (home_file ("Recipes/bread.txt"), true);
   ck_assert_str_eq (d, "search_document: File name: bread.txt\n"
                     "Location: ~/Recipes\nType: ASCII text\n\n"
                     "Sourdough starter notes\n");
@@ -651,9 +658,9 @@ START_TEST (test_describe_without_content)
 
   open_magic ();
   put ("note.txt", "Sourdough starter notes\n");
-  d = describe (home_file ("note.txt"), "other-model", false);
-  ck_assert_str_eq (d, "File name: note.txt\nLocation: ~\n"
-                    "Type: ASCII text\n\n");
+  d = describe (home_file ("note.txt"), false);
+  ck_assert_str_eq (d, "search_document: File name: note.txt\n"
+                    "Location: ~\nType: ASCII text\n\n");
 }
 END_TEST
 
@@ -665,8 +672,9 @@ START_TEST (test_describe_outside_home)
 
   open_magic ();
   write_file (p, "hello\n", (size_t) -1);
-  d = describe (p, "m", false);
-  if (asprintf (&expect, "File name: x.txt\nLocation: %s\n", dir) < 0)
+  d = describe (p, false);
+  if (asprintf (&expect, "search_document: File name: x.txt\n"
+                "Location: %s\n", dir) < 0)
     abort ();
   ck_assert_msg (starts_with (d, expect), "got: %s", d);
   tmpdir_remove (dir);
@@ -683,7 +691,7 @@ START_TEST (test_describe_home_prefix_sibling)
     abort ();
   p = path_join (sibling, "y.txt");
   write_file (p, "hello\n", (size_t) -1);
-  d = describe (p, "m", false);
+  d = describe (p, false);
   ck_assert_ptr_null (strstr (d, "Location: ~"));
   tmpdir_remove (sibling);
 }
@@ -699,7 +707,7 @@ START_TEST (test_describe_unreadable_file)
   open_magic ();
   put ("locked.txt", "sourdough");
   chmod (p, 0);
-  d = describe (p, "m", true);
+  d = describe (p, true);
   ck_assert_ptr_nonnull (strstr (d, "File name: locked.txt"));
   ck_assert_ptr_null (strstr (d, "sourdough"));
 }
@@ -713,7 +721,7 @@ START_TEST (test_describe_pdf_type)
     return;
   open_magic ();
   make_pdf ("Taxes/receipt.pdf", "Order receipt total 12 EUR");
-  d = describe (home_file ("Taxes/receipt.pdf"), "m", true);
+  d = describe (home_file ("Taxes/receipt.pdf"), true);
   ck_assert_ptr_nonnull (strstr (d, "Type: PDF document"));
   ck_assert_ptr_nonnull (strstr (d, "Order receipt total 12 EUR"));
 }
@@ -897,7 +905,7 @@ START_TEST (test_index_basic)
   ck_assert_int_eq (run_index (NULL), 0);
   store = read_file (fx.store);
   ck_assert_ptr_nonnull (store);
-  ck_assert (starts_with (store, "# embed-index model=nomic-embed-text "
+  ck_assert (starts_with (store, "# embed-index model=" EMBED_MODEL " "
                           "dim=8\n"));
   ck_assert_uint_eq (record_count (), 2);
   ck_assert_uint_eq (records_for ("Recipes/bread.txt"), 1);
@@ -1104,20 +1112,6 @@ START_TEST (test_index_falls_back_on_wrong_dimension)
 }
 END_TEST
 
-START_TEST (test_index_falls_back_when_slow)
-{
-  double start = now ();
-
-  put ("slow.txt", "FAKE_SLOW");
-  ck_assert_int_eq (run_index ("-t", "1", NULL), 0);
-  ck_assert_uint_eq (records_for ("slow.txt"), 1);
-  /* About a second for the attempt, then the slow server finishes its
-     sleep before answering the fallback, within the fallback's own
-     limit.  */
-  ck_assert_double_lt (now () - start, 1 + FALLBACK_TIMEOUT + 2);
-}
-END_TEST
-
 START_TEST (test_index_unembeddable_file)
 {
   put ("FAKE_500.txt", "alpha");
@@ -1137,14 +1131,14 @@ END_TEST
 
 START_TEST (test_index_quiet_unless_verbose)
 {
-  put ("tricky.txt", "FAKE_500");
+  put ("tricky.txt", "alpha");
   ck_assert_int_eq (run_index (NULL), 0);
-  ck_assert_ptr_null (strstr (err_text (), "returned 500"));
   ck_assert_ptr_null (strstr (err_text (), "tricky.txt"));
+  ck_assert_ptr_null (strstr (err_text (), "embedding on the"));
 
   touch_by ("tricky.txt", 10);
   ck_assert_int_eq (run_index ("-v", NULL), 0);
-  ck_assert_ptr_nonnull (strstr (err_text (), "returned 500"));
+  ck_assert_ptr_nonnull (strstr (err_text (), "embedding on the GPU\n"));
   ck_assert_ptr_nonnull (strstr (err_text (), "/tricky.txt\n"));
 }
 END_TEST
@@ -1211,42 +1205,40 @@ START_TEST (test_index_model_option_removed)
 }
 END_TEST
 
-/* Restart the fake server with its model in STATE.  */
-static void
-restart_fake (const char *state)
+START_TEST (test_index_model_unavailable)
 {
-  fake_stop (&fx.fake);
-  setenv ("FAKE_MODEL", state, 1);
-  fake_start (&fx.fake, fx.log);
-  unsetenv ("FAKE_MODEL");
-}
-
-START_TEST (test_index_pulls_missing_model)
-{
-  restart_fake ("missing");
+  setenv ("FAKE_MODEL", "fail", 1);
   put ("a.txt", "alpha");
-  ck_assert_int_eq (run_index (NULL), 0);
-  ck_assert_ptr_nonnull (strstr (err_text (), "downloading model "
-                                 EMBED_MODEL));
-  ck_assert_uint_eq (record_count (), 1);
-  /* The second run finds it in place.  */
-  put ("b.txt", "omega");
-  ck_assert_int_eq (run_index (NULL), 0);
-  ck_assert_ptr_null (strstr (err_text (), "downloading"));
-  ck_assert_uint_eq (record_count (), 2);
+  ck_assert_int_eq (run_index (NULL), EXIT_FAILURE);
+  ck_assert_ptr_nonnull (strstr (err_text (), "cannot open the "
+                                 EMBED_MODEL " model"));
+  ck_assert_ptr_null (read_file (fx.store));
+  ck_assert_ptr_null (read_file (fx.log));
 }
 END_TEST
 
-START_TEST (test_index_pull_fails)
+START_TEST (test_index_gpu_by_default)
 {
-  restart_fake ("pullfail");
   put ("a.txt", "alpha");
-  ck_assert_int_eq (run_index (NULL), EXIT_FAILURE);
-  ck_assert_ptr_nonnull (strstr (err_text (), "cannot download model"));
-  ck_assert_ptr_nonnull (strstr (err_text (), "model " EMBED_MODEL
-                                 " is unavailable"));
+  ck_assert_int_eq (run_index (NULL), 0);
+  ck_assert (starts_with (read_file (fx.log), "open gpu=1\n----\n"));
+  unlink (fx.log);
+  touch_by ("a.txt", 10);
+  ck_assert_int_eq (run_index ("--cpu", "-v", NULL), 0);
+  ck_assert (starts_with (read_file (fx.log), "open gpu=0\n----\n"));
+  ck_assert_ptr_nonnull (strstr (err_text (), "embedding on the CPU\n"));
+  ck_assert_uint_eq (records_for ("a.txt"), 1);
+}
+END_TEST
+
+START_TEST (test_index_removed_options)
+{
+  ck_assert_int_eq (run_index ("-t", "5", NULL), EXIT_FAILURE);
+  ck_assert_int_eq (run_index ("-H", "http://localhost:1", NULL),
+                    EXIT_FAILURE);
+  ck_assert_int_eq (run_index ("--host=http://localhost:1", NULL),
+                    EXIT_FAILURE);
   ck_assert_ptr_null (read_file (fx.store));
-  ck_assert_uint_eq (requests (), 0);
 }
 END_TEST
 
@@ -1281,11 +1273,11 @@ END_TEST
 START_TEST (test_index_header_without_newline)
 {
   put ("a.txt", "alpha");
-  write_file (fx.store, "# embed-index model=nomic-embed-text dim=8",
+  write_file (fx.store, "# embed-index model=" EMBED_MODEL " dim=8",
               (size_t) -1);
   ck_assert_msg (run_index (NULL) == 0, "stderr: %s", err_text ());
   ck_assert (starts_with (read_file (fx.store), "# embed-index "
-                          "model=nomic-embed-text dim=8\n"));
+                          "model=" EMBED_MODEL " dim=8\n"));
   ck_assert_uint_eq (records_for ("a.txt"), 1);
 }
 END_TEST
@@ -1369,10 +1361,10 @@ START_TEST (test_index_progress_on_terminal)
   ck_assert_int_ge (pid, 0);
   if (pid == 0)
     {
-      char *argv[] = { "embed-index", "-H", fx.fake.url, NULL };
+      char *argv[] = { "embed-index", NULL };
       /* Only standard error is a terminal.  */
       freopen ("/dev/null", "w", stdout);
-      exit (index_main (3, argv));
+      exit (index_main (1, argv));
     }
   for (;;)
     {
@@ -1402,18 +1394,6 @@ START_TEST (test_index_corrupt_store)
 }
 END_TEST
 
-START_TEST (test_index_server_down)
-{
-  char *argv[] = { "embed-index", "-H", (char *) dead_url (), NULL };
-
-  put ("a.txt", "alpha");
-  ck_assert_int_eq (run_main (index_main, argv, fx.out, fx.err),
-                    EXIT_FAILURE);
-  ck_assert_ptr_nonnull (strstr (err_text (), "is unavailable"));
-  ck_assert_ptr_null (read_file (fx.store));
-}
-END_TEST
-
 START_TEST (test_index_interrupted)
 {
   put ("a.txt", "alpha");
@@ -1425,7 +1405,7 @@ START_TEST (test_index_interrupted)
   put ("slow2.txt", "FAKE_SLOW");
   put ("slow3.txt", "FAKE_SLOW");
   unlink (home_file ("a.txt"));
-  char *argv[] = { "embed-index", "-H", fx.fake.url, NULL };
+  char *argv[] = { "embed-index", NULL };
   double start = now ();
   ck_assert_int_eq (run_main_signal (index_main, argv, fx.out, fx.err, 1500,
                                      SIGINT), 130);
@@ -1446,7 +1426,7 @@ START_TEST (test_index_interrupted_keeps_unvisited)
   ck_assert_int_eq (run_index (NULL), 0);
   put ("a/slow.txt", "FAKE_SLOW");
   put ("a/slow2.txt", "FAKE_SLOW");
-  char *argv[] = { "embed-index", "-H", fx.fake.url, NULL };
+  char *argv[] = { "embed-index", NULL };
   ck_assert_int_eq (run_main_signal (index_main, argv, fx.out, fx.err, 1000,
                                      SIGTERM), 130);
   ck_assert_uint_eq (records_for ("a/1.txt"), 1);
@@ -1469,41 +1449,6 @@ START_TEST (test_index_options)
   ck_assert_int_eq (run_main (index_main, bad, fx.out, fx.err),
                     EXIT_FAILURE);
   ck_assert_ptr_nonnull (strstr (err_text (), "--help"));
-}
-END_TEST
-
-START_TEST (test_index_bad_timeout)
-{
-  static const char *const bad[] = { "0", "-3", "abc", "5x", "", NULL };
-
-  for (int i = 0; bad[i]; i++)
-    {
-      ck_assert_msg (run_index ("-t", bad[i], NULL) == EXIT_FAILURE,
-                     "timeout '%s' accepted", bad[i]);
-      ck_assert_ptr_null (read_file (fx.store));
-    }
-}
-END_TEST
-
-START_TEST (test_index_private_gpu_server)
-{
-  char *env_file = path_join (fx.root, "server-env");
-  char *runner_file = path_join (fx.root, "server-runner");
-  char *argv[] = { "embed-index", NULL };
-  char *env, *s;
-
-  install_fake_ollama (fx.root);
-  setenv ("FAKE_OLLAMA_ENV", env_file, 1);
-  setenv ("FAKE_OLLAMA_RUNNER", runner_file, 1);
-  put ("docs/a.txt", "alpha");
-  ck_assert_int_eq (run_main (index_main, argv, fx.out, fx.err), 0);
-  ck_assert_uint_eq (records_for ("docs/a.txt"), 1);
-
-  env = read_file (env_file);
-  ck_assert_str_eq (env_lookup (env, "OLLAMA_VULKAN"), "1");
-  ck_assert_ptr_null (env_lookup (env, "GGML_VK_VISIBLE_DEVICES"));
-  s = read_file (runner_file);
-  ck_assert (process_gone (atoi (s), 2000));
 }
 END_TEST
 
@@ -1586,15 +1531,15 @@ index_suite (void)
   tcase_add_test (tc, test_index_odd_file_names);
   tcase_add_test (tc, test_index_falls_back_to_name);
   tcase_add_test (tc, test_index_falls_back_on_wrong_dimension);
-  tcase_add_test (tc, test_index_falls_back_when_slow);
   tcase_add_test (tc, test_index_unembeddable_file);
   tcase_add_test (tc, test_index_quiet_unless_verbose);
   tcase_add_test (tc, test_index_long_file_is_cut);
   tcase_add_test (tc, test_index_binary_content_is_safe);
   tcase_add_test (tc, test_index_model_change);
   tcase_add_test (tc, test_index_model_option_removed);
-  tcase_add_test (tc, test_index_pulls_missing_model);
-  tcase_add_test (tc, test_index_pull_fails);
+  tcase_add_test (tc, test_index_model_unavailable);
+  tcase_add_test (tc, test_index_gpu_by_default);
+  tcase_add_test (tc, test_index_removed_options);
   tcase_add_test (tc, test_index_recovers_from_crash);
   tcase_add_test (tc, test_index_header_without_newline);
   tcase_add_test (tc, test_index_wrong_dimension_reported);
@@ -1603,12 +1548,9 @@ index_suite (void)
   tcase_add_test (tc, test_index_compaction_fails_safely);
   tcase_add_test (tc, test_index_progress_on_terminal);
   tcase_add_test (tc, test_index_corrupt_store);
-  tcase_add_test (tc, test_index_server_down);
   tcase_add_test (tc, test_index_interrupted);
   tcase_add_test (tc, test_index_interrupted_keeps_unvisited);
   tcase_add_test (tc, test_index_options);
-  tcase_add_test (tc, test_index_bad_timeout);
-  tcase_add_test (tc, test_index_private_gpu_server);
   suite_add_tcase (s, tc);
 
   return s;

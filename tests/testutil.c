@@ -22,10 +22,6 @@
 #include <time.h>
 #include <unistd.h>
 
-#ifndef FAKE_OLLAMA
-# error "FAKE_OLLAMA must name the fake ollama program"
-#endif
-
 static void
 die (const char *what)
 {
@@ -34,7 +30,7 @@ die (const char *what)
 }
 
 void
-fake_start (struct fake *f, const char *log)
+fake_start (struct fake *f, const char *dir)
 {
   int fd;
 
@@ -46,8 +42,11 @@ fake_start (struct fake *f, const char *log)
     die ("fork");
   if (f->pid == 0)
     {
+      /* Its own group, so that fake_stop also gets the children that
+         serve each connection.  */
+      setpgid (0, 0);
       prctl (PR_SET_PDEATHSIG, SIGKILL);
-      fake_serve (fd, log);
+      fake_serve (fd, dir);
     }
   close (fd);
 }
@@ -57,6 +56,7 @@ fake_stop (struct fake *f)
 {
   if (f->pid > 0)
     {
+      kill (-f->pid, SIGKILL);
       kill (f->pid, SIGKILL);
       waitpid (f->pid, NULL, 0);
       f->pid = 0;
@@ -242,42 +242,6 @@ run_main_signal (int (*fn) (int, char **), char *const *argv,
   nanosleep (&delay, NULL);
   kill (pid, signo);
   return wait_status (pid);
-}
-
-void
-install_fake_ollama (const char *dir)
-{
-  char *bin = path_join (dir, "bin");
-  char *link = path_join (bin, "ollama");
-  const char *path = getenv ("PATH");
-  char *new_path;
-
-  mkdir (bin, 0755);
-  if (symlink (FAKE_OLLAMA, link) != 0)
-    die ("symlink");
-  if (asprintf (&new_path, "%s:%s", bin, path ? path : "/usr/bin") < 0)
-    die ("asprintf");
-  setenv ("PATH", new_path, 1);
-  free (new_path);
-  free (link);
-  free (bin);
-}
-
-char *
-env_lookup (const char *dump, const char *name)
-{
-  size_t n = strlen (name);
-
-  for (const char *p = dump; p && *p; )
-    {
-      const char *eol = strchr (p, '\n');
-      size_t len = eol ? (size_t) (eol - p) : strlen (p);
-
-      if (len > n && strncmp (p, name, n) == 0 && p[n] == '=')
-        return strndup (p + n + 1, len - n - 1);
-      p += len + (eol != NULL);
-    }
-  return NULL;
 }
 
 bool

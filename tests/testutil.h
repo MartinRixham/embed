@@ -13,7 +13,7 @@
 #include <stddef.h>
 #include <sys/types.h>
 
-/* A fake Ollama API server running in a child process.  */
+/* A fake HTTP server running in a child process.  */
 struct fake
 {
   pid_t pid;
@@ -21,9 +21,9 @@ struct fake
   char url[64];
 };
 
-/* Start a fake server logging embed request bodies to LOG (or not, if
-   NULL).  It dies with the calling process.  */
-void fake_start (struct fake *f, const char *log);
+/* Start a fake file server (see fake-http.h) serving DIR.  It dies
+   with the calling process.  */
+void fake_start (struct fake *f, const char *dir);
 void fake_stop (struct fake *f);
 
 /* Return a URL on which nothing is listening.  */
@@ -64,12 +64,6 @@ int run_main_signal (int (*fn) (int, char **), char *const *argv,
                      const char *out, const char *err, int delay_ms,
                      int signo);
 
-/* Put a fake "ollama" program in DIR/bin and put that first on PATH.  */
-void install_fake_ollama (const char *dir);
-
-/* Return the value of NAME in an environment dump made by the fake
-   ollama, freshly allocated, or NULL if it is not set there.  */
-char *env_lookup (const char *dump, const char *name);
 
 /* Return true if process PID has gone, waiting up to MS milliseconds.
    Zombies count as gone.  */

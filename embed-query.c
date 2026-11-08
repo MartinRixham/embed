@@ -6,13 +6,13 @@
    the Free Software Foundation, either version 3 of the License, or
    (at your option) any later version.
 
-   The query is embedded by a private Ollama server, with the same
-   model that built the store, and
-   the store is scanned once, keeping the best matches by cosine
+   The query is embedded on the CPU, which for a single short text is
+   quicker than starting up the GPU, by the model that built the store,
+   and the store is scanned, keeping the best matches by cosine
    similarity.  */
 
 #include "common.h"
-#include "server.h"
+#include "model.h"
 
 #include <errno.h>
 #include <error.h>
@@ -29,7 +29,6 @@ struct match
 
 static struct option const long_options[] = {
   {"count", required_argument, NULL, 'n'},
-  {"host", required_argument, NULL, 'H'},
   {"scores", no_argument, NULL, 's'},
   {"help", no_argument, NULL, 'h'},
   {"version", no_argument, NULL, 'V'},
@@ -48,9 +47,6 @@ usage (int status)
           "List the files that best match QUERY, best first.\n\n"
           "  -n, --count=N        show N matches (default 10)\n"
           "  -s, --scores         show the similarity score of each match\n"
-          "  -H, --host=URL       use the Ollama server at URL instead of "
-          "starting\n"
-          "                       a private one\n"
           "      --help           display this help and exit\n"
           "      --version        output version information and exit\n\n"
           "Run embed-index first to build the store.\n");
@@ -171,8 +167,6 @@ find_latest (FILE *f, size_t *n)
 int
 main (int argc, char **argv)
 {
-  const char *host = NULL;
-  struct server srv = { 0 };
   size_t count = 10, used = 0, dim, qdim;
   bool show_scores = false;
   char model[256];
@@ -181,7 +175,7 @@ main (int argc, char **argv)
   size_t line_size = 0;
   ssize_t len;
   struct buf query;
-  struct embedder emb;
+  struct model *m;
   struct match *matches;
   struct latest *latest;
   size_t n_latest;
@@ -190,7 +184,7 @@ main (int argc, char **argv)
   FILE *f;
   int c;
 
-  while ((c = getopt_long (argc, argv, "n:H:s", long_options, NULL)) != -1)
+  while ((c = getopt_long (argc, argv, "n:s", long_options, NULL)) != -1)
     switch (c)
       {
       case 'n':
@@ -200,9 +194,6 @@ main (int argc, char **argv)
             error (EXIT_FAILURE, 0, "invalid count: %s", optarg);
           count = n;
         }
-        break;
-      case 'H':
-        host = optarg;
         break;
       case 's':
         show_scores = true;
@@ -232,7 +223,7 @@ main (int argc, char **argv)
            "rebuild it with %s", store, model, EMBED_MODEL);
 
   buf_init (&query);
-  buf_puts (&query, query_prefix (model));
+  buf_puts (&query, QUERY_PREFIX);
   for (int i = optind; i < argc; i++)
     {
       if (i > optind)
@@ -241,20 +232,13 @@ main (int argc, char **argv)
     }
 
   /* A single short query is quicker on the CPU than it takes the GPU
-     just to initialize.  */
-  if (!host)
-    {
-      server_start (&srv, false);
-      host = srv.url;
-    }
-  embedder_init (&emb, host, model);
-  if (!ensure_model (&emb))
-    error (EXIT_FAILURE, 0, "model %s is unavailable at %s", model, host);
-  if (!embed_text (&emb, query.data, 120, &qvec, &qdim))
-    error (EXIT_FAILURE, 0, "cannot embed query with %s at %s", model,
-           host);
-  embedder_free (&emb);
-  server_stop (&srv);
+     just to compile the model.  */
+  m = model_open (false);
+  if (!m)
+    error (EXIT_FAILURE, 0, "cannot open the %s model", EMBED_MODEL);
+  if (!model_embed (m, query.data, &qvec, &qdim))
+    error (EXIT_FAILURE, 0, "cannot embed the query");
+  model_close (m);
   if (qdim != dim)
     error (EXIT_FAILURE, 0, "query has dimension %zu but store has %zu",
            qdim, dim);

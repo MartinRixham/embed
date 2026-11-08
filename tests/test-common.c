@@ -11,33 +11,10 @@
 
 #include "../common.c"
 
-#include "fake-http.h"
 #include "testutil.h"
 
 #include <check.h>
 #include <unistd.h>
-
-/* Return the JSON literal that buf_json_string makes of S, freshly
-   allocated.  */
-static char *
-json_of (const char *s)
-{
-  struct buf b;
-
-  buf_init (&b);
-  buf_json_string (&b, s);
-  return b.data;
-}
-
-static double
-norm_of (const float *v, size_t n)
-{
-  double s = 0;
-
-  for (size_t i = 0; i < n; i++)
-    s += (double) v[i] * v[i];
-  return sqrt (s);
-}
 
 /* Memory helpers.  */
 
@@ -156,150 +133,6 @@ END_TEST
 
 /* UTF-8 validation.  */
 
-static size_t
-u8 (const char *s, size_t n)
-{
-  return utf8_len ((const unsigned char *) s, n);
-}
-
-START_TEST (test_utf8_valid)
-{
-  ck_assert_uint_eq (u8 ("a", 1), 1);
-  ck_assert_uint_eq (u8 ("\x7f", 1), 1);
-  ck_assert_uint_eq (u8 ("\xc2\xa3", 2), 2);           /* U+00A3 */
-  ck_assert_uint_eq (u8 ("\xdf\xbf", 2), 2);           /* U+07FF */
-  ck_assert_uint_eq (u8 ("\xe0\xa0\x80", 3), 3);       /* U+0800 */
-  ck_assert_uint_eq (u8 ("\xe2\x82\xac", 3), 3);       /* U+20AC */
-  ck_assert_uint_eq (u8 ("\xef\xbf\xbd", 3), 3);       /* U+FFFD */
-  ck_assert_uint_eq (u8 ("\xf0\x90\x80\x80", 4), 4);   /* U+10000 */
-  ck_assert_uint_eq (u8 ("\xf0\x9f\x98\x80", 4), 4);   /* U+1F600 */
-  ck_assert_uint_eq (u8 ("\xf4\x8f\xbf\xbf", 4), 4);   /* U+10FFFF */
-}
-END_TEST
-
-START_TEST (test_utf8_bad_lead_bytes)
-{
-  ck_assert_uint_eq (u8 ("\x80", 1), 0);
-  ck_assert_uint_eq (u8 ("\xbf", 1), 0);
-  ck_assert_uint_eq (u8 ("\xc0\x80", 2), 0);
-  ck_assert_uint_eq (u8 ("\xc1\xbf", 2), 0);
-  ck_assert_uint_eq (u8 ("\xf5\x80\x80\x80", 4), 0);
-  ck_assert_uint_eq (u8 ("\xf8\x80\x80\x80", 4), 0);
-  ck_assert_uint_eq (u8 ("\xff", 1), 0);
-}
-END_TEST
-
-START_TEST (test_utf8_truncated_and_bad_continuation)
-{
-  ck_assert_uint_eq (u8 ("\xc2", 1), 0);
-  ck_assert_uint_eq (u8 ("\xe2\x82", 2), 0);
-  ck_assert_uint_eq (u8 ("\xf0\x9f\x98", 3), 0);
-  ck_assert_uint_eq (u8 ("\xc2" "a", 2), 0);
-  ck_assert_uint_eq (u8 ("\xe2\x82" "a", 3), 0);
-  ck_assert_uint_eq (u8 ("\xf0\x9f\x98\xc0", 4), 0);
-}
-END_TEST
-
-START_TEST (test_utf8_overlong_and_out_of_range)
-{
-  /* Overlong encodings of U+0000 and U+FFFF.  */
-  ck_assert_uint_eq (u8 ("\xe0\x80\x80", 3), 0);
-  ck_assert_uint_eq (u8 ("\xe0\x9f\xbf", 3), 0);
-  ck_assert_uint_eq (u8 ("\xf0\x80\x80\x80", 4), 0);
-  ck_assert_uint_eq (u8 ("\xf0\x8f\xbf\xbf", 4), 0);
-  /* UTF-16 surrogates U+D800 and U+DFFF.  */
-  ck_assert_uint_eq (u8 ("\xed\xa0\x80", 3), 0);
-  ck_assert_uint_eq (u8 ("\xed\xbf\xbf", 3), 0);
-  /* Just past U+10FFFF.  */
-  ck_assert_uint_eq (u8 ("\xf4\x90\x80\x80", 4), 0);
-}
-END_TEST
-
-/* JSON string escaping.  */
-
-START_TEST (test_json_plain)
-{
-  char *j = json_of ("hello world");
-  ck_assert_str_eq (j, "\"hello world\"");
-  free (j);
-  j = json_of ("");
-  ck_assert_str_eq (j, "\"\"");
-  free (j);
-}
-END_TEST
-
-START_TEST (test_json_escapes)
-{
-  char *j = json_of ("say \"hi\" \\ back\nslash");
-  ck_assert_str_eq (j, "\"say \\\"hi\\\" \\\\ back\\nslash\"");
-  free (j);
-}
-END_TEST
-
-START_TEST (test_json_control_characters)
-{
-  char *j = json_of ("a\tb\rc\x01" "d\x1f" "e\x7f" "f\x1b[0m");
-  ck_assert_str_eq (j, "\"a b c d e f [0m\"");
-  free (j);
-}
-END_TEST
-
-START_TEST (test_json_keeps_valid_utf8)
-{
-  char *j = json_of ("£49.40 €5 \xf0\x9f\x98\x80 日本");
-  ck_assert_str_eq (j, "\"£49.40 €5 \xf0\x9f\x98\x80 日本\"");
-  free (j);
-}
-END_TEST
-
-START_TEST (test_json_replaces_invalid_utf8)
-{
-  char *j = json_of ("a\xff" "b\xc2" "c\xe2\x82" "d\xed\xa0\x80" "e");
-  /* Each bad byte becomes one '?'.  */
-  ck_assert_str_eq (j, "\"a?b?c??d???e\"");
-  free (j);
-  /* A sequence cut short at the end of the string.  */
-  j = json_of ("x\xe2\x82");
-  ck_assert_str_eq (j, "\"x??\"");
-  free (j);
-}
-END_TEST
-
-START_TEST (test_json_output_always_valid)
-{
-  /* Every byte value, in every position, gives a literal with no raw
-     control characters and balanced quotes.  */
-  char s[256];
-  char *j;
-
-  for (int i = 1; i < 256; i++)
-    s[i - 1] = (char) i;
-  s[255] = '\0';
-  j = json_of (s);
-  ck_assert_int_eq (j[0], '"');
-  ck_assert_int_eq (j[strlen (j) - 1], '"');
-  for (const unsigned char *p = (unsigned char *) j; *p; p++)
-    ck_assert_int_ge (*p, 0x20);
-  free (j);
-}
-END_TEST
-
-/* Model prefixes.  */
-
-START_TEST (test_prefixes)
-{
-  ck_assert_str_eq (document_prefix ("nomic-embed-text"),
-                    "search_document: ");
-  ck_assert_str_eq (query_prefix ("nomic-embed-text:latest"),
-                    "search_query: ");
-  ck_assert_str_eq (document_prefix ("qwen3-embedding:0.6b"), "");
-  ck_assert_ptr_nonnull (strstr (query_prefix ("qwen3-embedding:0.6b"),
-                                 "Query: "));
-  ck_assert_str_eq (document_prefix ("all-minilm"), "");
-  ck_assert_str_eq (query_prefix ("all-minilm"), "");
-}
-END_TEST
-
 /* Store path.  */
 
 START_TEST (test_store_path)
@@ -324,6 +157,17 @@ START_TEST (test_store_path_empty_home)
 {
   setenv ("HOME", "", 1);
   store_path ();
+}
+END_TEST
+
+START_TEST (test_data_path)
+{
+  char *p;
+
+  setenv ("HOME", "/home/someone", 1);
+  p = data_path ("models/x/");
+  ck_assert_str_eq (p, "/home/someone/.local/share/embed/models/x/");
+  free (p);
 }
 END_TEST
 
@@ -410,351 +254,6 @@ START_TEST (test_make_parent_dirs_blocked)
 }
 END_TEST
 
-/* Embedding requests, against a fake server.  */
-
-struct fixture
-{
-  char *dir;
-  char *log;
-  struct fake fake;
-  struct embedder emb;
-};
-
-static void
-fixture_init (struct fixture *fx, const char *model)
-{
-  fx->dir = tmpdir_new ();
-  fx->log = path_join (fx->dir, "requests.log");
-  fake_start (&fx->fake, fx->log);
-  embedder_init (&fx->emb, fx->fake.url, model);
-}
-
-static void
-fixture_free (struct fixture *fx)
-{
-  embedder_free (&fx->emb);
-  fake_stop (&fx->fake);
-  tmpdir_remove (fx->dir);
-}
-
-START_TEST (test_embedder_init_url)
-{
-  struct embedder e;
-
-  embedder_init (&e, "http://example:1", "m");
-  ck_assert_str_eq (e.url, "http://example:1/api/embed");
-  ck_assert_str_eq (e.host, "http://example:1");
-  ck_assert_str_eq (e.model, "m");
-  embedder_free (&e);
-}
-END_TEST
-
-START_TEST (test_embed_success_normalized)
-{
-  struct fixture fx;
-  float *v;
-  size_t dim = 0;
-
-  fixture_init (&fx, "fake-model");
-  ck_assert (embed_text (&fx.emb, "sourdough sourdough invoice", 5, &v,
-                         &dim));
-  ck_assert_uint_eq (dim, FAKE_DIM);
-  ck_assert_double_eq_tol (norm_of (v, dim), 1.0, 1e-5);
-  /* 2.05 : 1.05 : 0.05 ... before normalization.  */
-  ck_assert_double_eq_tol (v[0] / v[1], 2.05 / 1.05, 1e-4);
-  ck_assert_double_eq_tol (v[2] / v[1], 0.05 / 1.05, 1e-4);
-  free (v);
-  fixture_free (&fx);
-}
-END_TEST
-
-START_TEST (test_embed_request_body)
-{
-  struct fixture fx;
-  float *v;
-  size_t dim;
-  char *log;
-
-  fixture_init (&fx, "my-model");
-  ck_assert (embed_text (&fx.emb, "line one\n\"quoted\" £", 5, &v, &dim));
-  free (v);
-  log = read_file (fx.log);
-  ck_assert_ptr_nonnull (log);
-  ck_assert_ptr_nonnull (strstr (log, "\"model\":\"my-model\""));
-  ck_assert_ptr_nonnull (strstr (log, "\"truncate\":true"));
-  ck_assert_ptr_nonnull (strstr (log, "\"keep_alive\":\"10m\""));
-  ck_assert_ptr_nonnull (strstr (log, "\"input\":\"line one\\n\\\"quoted\\\" "
-                                 "£\""));
-  free (log);
-  fixture_free (&fx);
-}
-END_TEST
-
-START_TEST (test_embed_reuses_connection_handle)
-{
-  struct fixture fx;
-  float *v;
-  size_t dim;
-
-  fixture_init (&fx, "m");
-  for (int i = 0; i < 20; i++)
-    {
-      ck_assert (embed_text (&fx.emb, "omega", 5, &v, &dim));
-      ck_assert_float_gt (v[7], 0.9);
-      free (v);
-    }
-  ck_assert_uint_eq (count_substr (read_file (fx.log), "----"), 20);
-  fixture_free (&fx);
-}
-END_TEST
-
-START_TEST (test_embed_large_input)
-{
-  struct fixture fx;
-  size_t n = 200000;
-  char *text = xmalloc (n + 1);
-  float *v;
-  size_t dim;
-
-  memset (text, 'z', n);
-  memcpy (text + n - 6, "sunset", 6);
-  text[n] = '\0';
-  fixture_init (&fx, "m");
-  ck_assert (embed_text (&fx.emb, text, 5, &v, &dim));
-  ck_assert_float_gt (v[4], 0.9);
-  free (v);
-  free (text);
-  fixture_free (&fx);
-}
-END_TEST
-
-START_TEST (test_embed_tolerates_white_space)
-{
-  struct fixture fx;
-  float *v = NULL;
-  size_t dim = 0;
-
-  fixture_init (&fx, "m");
-  ck_assert (embed_text (&fx.emb, "FAKE_SPACES alpha", 5, &v, &dim));
-  ck_assert_uint_eq (dim, FAKE_DIM);
-  ck_assert_float_gt (v[6], 0.9);
-  free (v);
-  fixture_free (&fx);
-}
-END_TEST
-
-START_TEST (test_embed_zero_vector)
-{
-  struct fixture fx;
-  float *v;
-  size_t dim;
-
-  fixture_init (&fx, "m");
-  ck_assert (embed_text (&fx.emb, "FAKE_ZERO", 5, &v, &dim));
-  ck_assert_uint_eq (dim, FAKE_DIM);
-  for (size_t i = 0; i < dim; i++)
-    ck_assert (v[i] == 0 && !isnan (v[i]));
-  free (v);
-  fixture_free (&fx);
-}
-END_TEST
-
-START_TEST (test_embed_other_dimension)
-{
-  struct fixture fx;
-  float *v;
-  size_t dim;
-
-  fixture_init (&fx, "m");
-  ck_assert (embed_text (&fx.emb, "FAKE_DIM3", 5, &v, &dim));
-  ck_assert_uint_eq (dim, 3);
-  free (v);
-  fixture_free (&fx);
-}
-END_TEST
-
-/* Check that embedding TEXT fails, leaves its outputs alone, and
-   reports the failure on standard error containing EXPECT.  */
-static void
-check_embed_fails (const char *text, const char *expect)
-{
-  struct fixture fx;
-  float *v = (float *) &v;
-  size_t dim = 12345;
-  char *err_path, *err;
-
-  fixture_init (&fx, "m");
-  err_path = path_join (fx.dir, "stderr");
-  ck_assert_ptr_nonnull (freopen (err_path, "w", stderr));
-  ck_assert (!embed_text (&fx.emb, text, 5, &v, &dim));
-  fflush (stderr);
-  ck_assert_ptr_eq (v, (float *) &v);
-  ck_assert_uint_eq (dim, 12345);
-  err = read_file (err_path);
-  ck_assert_msg (strstr (err, expect), "stderr was: %s", err);
-  free (err);
-  fixture_free (&fx);
-}
-
-/* Run ensure_model against a fake server whose model is in STATE (see
-   fake-http.h), or NULL for a plain dead URL.  Return its result, and
-   store what it wrote on standard error in *ERR.  After a successful
-   call, check that embedding works.  */
-static bool
-run_ensure_model (const char *state, char **err)
-{
-  struct fixture fx;
-  char *err_path;
-  bool ok;
-
-  if (state)
-    setenv ("FAKE_MODEL", state, 1);
-  else
-    unsetenv ("FAKE_MODEL");
-  fixture_init (&fx, "m");
-  unsetenv ("FAKE_MODEL");
-  if (!state)
-    {
-      free (fx.emb.host);
-      fx.emb.host = xstrdup (dead_url ());
-    }
-  err_path = path_join (fx.dir, "stderr");
-  ck_assert_ptr_nonnull (freopen (err_path, "w", stderr));
-  ok = ensure_model (&fx.emb);
-  fflush (stderr);
-  *err = read_file (err_path);
-  if (ok)
-    {
-      float *v;
-      size_t dim;
-
-      ck_assert (embed_text (&fx.emb, "sourdough", 5, &v, &dim));
-      free (v);
-      /* Pulled once and for all.  */
-      ck_assert (ensure_model (&fx.emb));
-    }
-  fixture_free (&fx);
-  return ok;
-}
-
-START_TEST (test_ensure_model_present)
-{
-  char *err;
-
-  ck_assert (run_ensure_model ("", &err));
-  ck_assert_str_eq (err, "");
-}
-END_TEST
-
-START_TEST (test_ensure_model_pulls_missing)
-{
-  char *err;
-
-  ck_assert (run_ensure_model ("missing", &err));
-  ck_assert_msg (strstr (err, "downloading model m"), "stderr: %s", err);
-  ck_assert_uint_eq (count_substr (err, "downloading"), 1);
-}
-END_TEST
-
-START_TEST (test_ensure_model_pull_error)
-{
-  char *err;
-
-  ck_assert (!run_ensure_model ("pullfail", &err));
-  ck_assert_msg (strstr (err, "cannot download model m"), "stderr: %s",
-                 err);
-  ck_assert_ptr_nonnull (strstr (err, "file does not exist"));
-}
-END_TEST
-
-START_TEST (test_ensure_model_pull_http_error)
-{
-  char *err;
-
-  ck_assert (!run_ensure_model ("pull500", &err));
-  ck_assert_msg (strstr (err, "returned 500"), "stderr: %s", err);
-  ck_assert_ptr_nonnull (strstr (err, "registry unreachable"));
-}
-END_TEST
-
-START_TEST (test_ensure_model_show_error)
-{
-  char *err;
-
-  ck_assert (!run_ensure_model ("showfail", &err));
-  ck_assert_msg (strstr (err, "cannot look up model m"), "stderr: %s", err);
-  ck_assert_ptr_null (strstr (err, "downloading"));
-}
-END_TEST
-
-START_TEST (test_ensure_model_server_down)
-{
-  char *err;
-
-  ck_assert (!run_ensure_model (NULL, &err));
-  ck_assert_msg (strstr (err, "/api/show failed"), "stderr: %s", err);
-}
-END_TEST
-
-START_TEST (test_last_line)
-{
-  ck_assert_str_eq (last_line (""), "");
-  ck_assert_str_eq (last_line ("one"), "one");
-  ck_assert_str_eq (last_line ("one\ntwo\n"), "two\n");
-  ck_assert_str_eq (last_line ("one\r\ntwo\r\n\n\n"), "two\r\n\n\n");
-  ck_assert_str_eq (last_line ("\n\n"), "\n\n");
-}
-END_TEST
-
-START_TEST (test_embed_http_error)
-{
-  check_embed_fails ("FAKE_500", "returned 500");
-}
-END_TEST
-
-START_TEST (test_embed_too_long)
-{
-  check_embed_fails ("FAKE_TOOLONG", "context length");
-}
-END_TEST
-
-START_TEST (test_embed_malformed)
-{
-  check_embed_fails ("FAKE_MALFORMED", "malformed");
-}
-END_TEST
-
-START_TEST (test_embed_empty_vector)
-{
-  check_embed_fails ("FAKE_EMPTY", "malformed");
-}
-END_TEST
-
-START_TEST (test_embed_missing_member)
-{
-  check_embed_fails ("FAKE_NOVEC", "returned 200");
-}
-END_TEST
-
-START_TEST (test_embed_bad_separator)
-{
-  check_embed_fails ("FAKE_BADSEP", "malformed");
-}
-END_TEST
-
-START_TEST (test_find_vector)
-{
-  ck_assert_str_eq (find_vector ("{\"embeddings\":[[1,2]]}"), "1,2]]}");
-  ck_assert_str_eq (find_vector ("{\"embeddings\" :\n [\t[ 1]]}"), " 1]]}");
-  ck_assert_ptr_null (find_vector ("{\"embedding\":[[1]]}"));
-  ck_assert_ptr_null (find_vector ("{\"embeddings\" [[1]]}"));
-  ck_assert_ptr_null (find_vector ("{\"embeddings\":{[1]]}"));
-  ck_assert_ptr_null (find_vector ("{\"embeddings\":[1,2]}"));
-  ck_assert_ptr_null (find_vector ("{\"embeddings\":"));
-  ck_assert_ptr_null (find_vector (""));
-}
-END_TEST
-
 START_TEST (test_parse_positive)
 {
   long v = -7;
@@ -774,57 +273,6 @@ START_TEST (test_parse_positive)
   ck_assert (!parse_positive ("", 10, &v));
   ck_assert (!parse_positive ("99999999999999999999999", 10, &v));
   ck_assert_int_eq (v, -7);
-}
-END_TEST
-
-START_TEST (test_embed_quiet)
-{
-  struct fixture fx;
-  float *v;
-  size_t dim;
-  char *err_path;
-
-  fixture_init (&fx, "m");
-  err_path = path_join (fx.dir, "stderr");
-  ck_assert_ptr_nonnull (freopen (err_path, "w", stderr));
-  embed_report_errors = false;
-  ck_assert (!embed_text (&fx.emb, "FAKE_500", 5, &v, &dim));
-  ck_assert (!embed_text (&fx.emb, "FAKE_MALFORMED", 5, &v, &dim));
-  fflush (stderr);
-  ck_assert_str_eq (read_file (err_path), "");
-  fixture_free (&fx);
-}
-END_TEST
-
-START_TEST (test_embed_timeout)
-{
-  struct fixture fx;
-  float *v;
-  size_t dim;
-  double start;
-
-  fixture_init (&fx, "m");
-  embed_report_errors = false;
-  start = now ();
-  ck_assert (!embed_text (&fx.emb, "FAKE_SLOW", 1, &v, &dim));
-  ck_assert_double_lt (now () - start, 2.5);
-  /* The handle still works afterwards.  */
-  ck_assert (embed_text (&fx.emb, "alpha", 5, &v, &dim));
-  free (v);
-  fixture_free (&fx);
-}
-END_TEST
-
-START_TEST (test_embed_connection_refused)
-{
-  struct embedder e;
-  float *v;
-  size_t dim;
-
-  embed_report_errors = false;
-  embedder_init (&e, dead_url (), "m");
-  ck_assert (!embed_text (&e, "alpha", 2, &v, &dim));
-  embedder_free (&e);
 }
 END_TEST
 
@@ -849,63 +297,21 @@ common_suite (void)
   tcase_add_test (tc, test_buf_embedded_nul);
   suite_add_tcase (s, tc);
 
-  tc = tcase_create ("utf8");
-  tcase_add_test (tc, test_utf8_valid);
-  tcase_add_test (tc, test_utf8_bad_lead_bytes);
-  tcase_add_test (tc, test_utf8_truncated_and_bad_continuation);
-  tcase_add_test (tc, test_utf8_overlong_and_out_of_range);
-  suite_add_tcase (s, tc);
 
-  tc = tcase_create ("json");
-  tcase_add_test (tc, test_json_plain);
-  tcase_add_test (tc, test_json_escapes);
-  tcase_add_test (tc, test_json_control_characters);
-  tcase_add_test (tc, test_json_keeps_valid_utf8);
-  tcase_add_test (tc, test_json_replaces_invalid_utf8);
-  tcase_add_test (tc, test_json_output_always_valid);
-  suite_add_tcase (s, tc);
 
   tc = tcase_create ("store");
-  tcase_add_test (tc, test_prefixes);
   tcase_add_test (tc, test_store_path);
   tcase_add_exit_test (tc, test_store_path_no_home, EXIT_FAILURE);
   tcase_add_exit_test (tc, test_store_path_empty_home, EXIT_FAILURE);
+  tcase_add_test (tc, test_data_path);
   tcase_add_test (tc, test_parse_header_valid);
   tcase_add_test (tc, test_parse_header_invalid);
   tcase_add_test (tc, test_parse_header_model_too_long);
-  tcase_add_test (tc, test_find_vector);
   tcase_add_test (tc, test_parse_positive);
   tcase_add_test (tc, test_make_parent_dirs);
   tcase_add_exit_test (tc, test_make_parent_dirs_blocked, EXIT_FAILURE);
   suite_add_tcase (s, tc);
 
-  tc = tcase_create ("embed");
-  tcase_set_timeout (tc, 20);
-  tcase_add_test (tc, test_embedder_init_url);
-  tcase_add_test (tc, test_embed_success_normalized);
-  tcase_add_test (tc, test_ensure_model_present);
-  tcase_add_test (tc, test_ensure_model_pulls_missing);
-  tcase_add_test (tc, test_ensure_model_pull_error);
-  tcase_add_test (tc, test_ensure_model_pull_http_error);
-  tcase_add_test (tc, test_ensure_model_show_error);
-  tcase_add_test (tc, test_ensure_model_server_down);
-  tcase_add_test (tc, test_last_line);
-  tcase_add_test (tc, test_embed_request_body);
-  tcase_add_test (tc, test_embed_reuses_connection_handle);
-  tcase_add_test (tc, test_embed_large_input);
-  tcase_add_test (tc, test_embed_tolerates_white_space);
-  tcase_add_test (tc, test_embed_zero_vector);
-  tcase_add_test (tc, test_embed_other_dimension);
-  tcase_add_test (tc, test_embed_http_error);
-  tcase_add_test (tc, test_embed_too_long);
-  tcase_add_test (tc, test_embed_malformed);
-  tcase_add_test (tc, test_embed_empty_vector);
-  tcase_add_test (tc, test_embed_missing_member);
-  tcase_add_test (tc, test_embed_bad_separator);
-  tcase_add_test (tc, test_embed_quiet);
-  tcase_add_test (tc, test_embed_timeout);
-  tcase_add_test (tc, test_embed_connection_refused);
-  suite_add_tcase (s, tc);
 
   return s;
 }

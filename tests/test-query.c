@@ -14,7 +14,7 @@
 #include "../embed-query.c"
 #undef main
 
-#include "fake-http.h"
+#include "fake-model.h"
 #include "testutil.h"
 
 #include <check.h>
@@ -33,7 +33,6 @@ struct fixture
   char *log;
   char *out;
   char *err;
-  struct fake fake;
 };
 
 static struct fixture fx;
@@ -49,13 +48,13 @@ setup (void)
   fx.out = path_join (fx.root, "stdout");
   fx.err = path_join (fx.root, "stderr");
   setenv ("HOME", fx.home, 1);
-  fake_start (&fx.fake, fx.log);
+  setenv ("FAKE_MODEL_LOG", fx.log, 1);
+  unsetenv ("FAKE_MODEL");
 }
 
 static void
 teardown (void)
 {
-  fake_stop (&fx.fake);
   tmpdir_remove (fx.root);
 }
 
@@ -93,7 +92,7 @@ make_store (const char *model, const char *path, ...)
   buf_free (&b);
 }
 
-/* Run embed-query against the fake server with the given arguments,
+/* Run embed-query with the fake model and the given arguments,
    ending with NULL.  */
 static int
 run_query (const char *arg, ...)
@@ -103,8 +102,6 @@ run_query (const char *arg, ...)
   va_list ap;
 
   argv[argc++] = "embed-query";
-  argv[argc++] = "-H";
-  argv[argc++] = fx.fake.url;
   va_start (ap, arg);
   for (const char *a = arg; a; a = va_arg (ap, const char *))
     argv[argc++] = (char *) a;
@@ -222,7 +219,7 @@ END_TEST
 
 START_TEST (test_query_ranks)
 {
-  make_store ("nomic-embed-text",
+  make_store (EMBED_MODEL,
               "/h/bread.txt", 0, "/h/invoice.pdf", 1, "/h/sonata.mp3", 2,
               "/h/mixed.txt", -1, NULL);
   ck_assert_int_eq (run_query ("sourdough", NULL), 0);
@@ -243,7 +240,7 @@ START_TEST (test_query_scores)
   double s1, s2;
   char p1[64], p2[64];
 
-  make_store ("nomic-embed-text", "/h/a", 0, "/h/b", 1, NULL);
+  make_store (EMBED_MODEL, "/h/a", 0, "/h/b", 1, NULL);
   ck_assert_int_eq (run_query ("-s", "sourdough", NULL), 0);
   out = out_text ();
   ck_assert_int_eq (sscanf (out, "%lf\t%63s\n%lf\t%63s", &s1, p1, &s2, p2),
@@ -284,12 +281,11 @@ START_TEST (test_query_joins_words_and_prefixes)
 {
   char *log;
 
-  make_store ("nomic-embed-text", "/h/a", 0, NULL);
+  make_store (EMBED_MODEL, "/h/a", 0, NULL);
   ck_assert_int_eq (run_query ("my", "tax", "receipts", NULL), 0);
   log = read_file (fx.log);
-  ck_assert_ptr_nonnull (strstr (log, "\"input\":\"search_query: my tax "
-                                 "receipts\""));
-  ck_assert_ptr_nonnull (strstr (log, "\"model\":\"nomic-embed-text\""));
+  ck_assert_str_eq (log, "open gpu=0\n----\n"
+                    "search_query: my tax receipts\n----\n");
 }
 END_TEST
 
@@ -299,35 +295,8 @@ START_TEST (test_query_rejects_other_model)
   ck_assert_int_eq (run_query ("x", NULL), EXIT_FAILURE);
   ck_assert_ptr_nonnull (strstr (err_text (), "built with "
                                  "qwen3-embedding:0.6b; run embed-index"));
-  /* Without asking the server.  */
+  /* Without opening the model.  */
   ck_assert_ptr_null (read_file (fx.log));
-}
-END_TEST
-
-START_TEST (test_query_pulls_missing_model)
-{
-  fake_stop (&fx.fake);
-  setenv ("FAKE_MODEL", "missing", 1);
-  fake_start (&fx.fake, fx.log);
-  unsetenv ("FAKE_MODEL");
-  make_store (EMBED_MODEL, "/h/bread.txt", 0, NULL);
-  ck_assert_int_eq (run_query ("sourdough", NULL), 0);
-  ck_assert_ptr_nonnull (strstr (err_text (), "downloading model "
-                                 EMBED_MODEL));
-  ck_assert_str_eq (out_text (), "/h/bread.txt\n");
-}
-END_TEST
-
-START_TEST (test_query_pull_fails)
-{
-  fake_stop (&fx.fake);
-  setenv ("FAKE_MODEL", "pull500", 1);
-  fake_start (&fx.fake, fx.log);
-  unsetenv ("FAKE_MODEL");
-  make_store (EMBED_MODEL, "/h/bread.txt", 0, NULL);
-  ck_assert_int_eq (run_query ("sourdough", NULL), EXIT_FAILURE);
-  ck_assert_ptr_nonnull (strstr (err_text (), "is unavailable"));
-  ck_assert_str_eq (out_text (), "");
 }
 END_TEST
 
@@ -391,7 +360,7 @@ START_TEST (test_query_missing_store)
 {
   ck_assert_int_eq (run_query ("x", NULL), EXIT_FAILURE);
   ck_assert_ptr_nonnull (strstr (err_text (), "run embed-index first"));
-  /* Without even starting a server.  */
+  /* Without even opening the model.  */
   ck_assert_ptr_null (read_file (fx.log));
 }
 END_TEST
@@ -414,22 +383,31 @@ START_TEST (test_query_dimension_mismatch)
 }
 END_TEST
 
-START_TEST (test_query_server_down)
+START_TEST (test_query_model_unavailable)
 {
-  char *argv[] = { "embed-query", "-H", (char *) dead_url (), "x", NULL };
-
   make_store (EMBED_MODEL, "/a", 0, NULL);
-  ck_assert_int_eq (run_main (query_main, argv, fx.out, fx.err),
-                    EXIT_FAILURE);
-  ck_assert_ptr_nonnull (strstr (err_text (), "is unavailable"));
+  setenv ("FAKE_MODEL", "fail", 1);
+  ck_assert_int_eq (run_query ("x", NULL), EXIT_FAILURE);
+  ck_assert_ptr_nonnull (strstr (err_text (), "cannot open the "
+                                 EMBED_MODEL " model"));
+  ck_assert_str_eq (out_text (), "");
 }
 END_TEST
 
-START_TEST (test_query_server_error)
+START_TEST (test_query_embedding_fails)
 {
   make_store (EMBED_MODEL, "/a", 0, NULL);
   ck_assert_int_eq (run_query ("FAKE_500", NULL), EXIT_FAILURE);
-  ck_assert_ptr_nonnull (strstr (err_text (), "cannot embed query"));
+  ck_assert_ptr_nonnull (strstr (err_text (), "cannot embed the query"));
+}
+END_TEST
+
+START_TEST (test_query_removed_host_option)
+{
+  make_store (EMBED_MODEL, "/a", 0, NULL);
+  ck_assert_int_eq (run_query ("-H", "http://localhost:1", "x", NULL),
+                    EXIT_FAILURE);
+  ck_assert_ptr_null (read_file (fx.log));
 }
 END_TEST
 
@@ -469,41 +447,19 @@ START_TEST (test_query_options)
 }
 END_TEST
 
-START_TEST (test_query_private_cpu_server)
-{
-  char *env_file = path_join (fx.root, "server-env");
-  char *runner_file = path_join (fx.root, "server-runner");
-  char *argv[] = { "embed-query", "sourdough", NULL };
-  char *env;
-
-  install_fake_ollama (fx.root);
-  setenv ("FAKE_OLLAMA_ENV", env_file, 1);
-  setenv ("FAKE_OLLAMA_RUNNER", runner_file, 1);
-  make_store (EMBED_MODEL, "/h/bread.txt", 0, NULL);
-  ck_assert_int_eq (run_main (query_main, argv, fx.out, fx.err), 0);
-  ck_assert_str_eq (out_text (), "/h/bread.txt\n");
-
-  env = read_file (env_file);
-  /* Queries run on the CPU.  */
-  ck_assert_str_eq (env_lookup (env, "GGML_VK_VISIBLE_DEVICES"), "-1");
-  ck_assert_str_eq (env_lookup (env, "OLLAMA_VULKAN"), "0");
-  ck_assert (process_gone (atoi (read_file (runner_file)), 2000));
-}
-END_TEST
-
 START_TEST (test_round_trip_with_indexer)
 {
   char *cmd;
 
-  /* Build a store with the real embed-index program, then search it.  */
+  /* Build a store with the embed-index program (built with the fake
+     model), then search it.  */
   write_file (path_join (fx.home, "Recipes/rye.txt"),
               "A sourdough rye with caraway.", (size_t) -1);
   write_file (path_join (fx.home, "Work/billing.txt"),
               "Invoice 1043, payable in 30 days.", (size_t) -1);
   write_file (path_join (fx.home, "Music/playlist.m3u"),
               "#EXTM3U\nMoonlight sonata.mp3\n", (size_t) -1);
-  if (asprintf (&cmd, "'%s' -H '%s' 2>/dev/null", EMBED_INDEX, fx.fake.url)
-      < 0)
+  if (asprintf (&cmd, "'%s' 2>/dev/null", EMBED_INDEX) < 0)
     abort ();
   ck_assert_int_eq (system (cmd), 0);
 
@@ -538,8 +494,6 @@ query_suite (void)
   tcase_add_test (tc, test_query_default_count);
   tcase_add_test (tc, test_query_joins_words_and_prefixes);
   tcase_add_test (tc, test_query_rejects_other_model);
-  tcase_add_test (tc, test_query_pulls_missing_model);
-  tcase_add_test (tc, test_query_pull_fails);
   tcase_add_test (tc, test_query_skips_bad_lines);
   tcase_add_test (tc, test_query_newest_record_wins);
   tcase_add_test (tc, test_query_stale_record_does_not_hide_match);
@@ -548,12 +502,12 @@ query_suite (void)
   tcase_add_test (tc, test_query_missing_store);
   tcase_add_test (tc, test_query_bad_header);
   tcase_add_test (tc, test_query_dimension_mismatch);
-  tcase_add_test (tc, test_query_server_down);
-  tcase_add_test (tc, test_query_server_error);
+  tcase_add_test (tc, test_query_model_unavailable);
+  tcase_add_test (tc, test_query_embedding_fails);
+  tcase_add_test (tc, test_query_removed_host_option);
   tcase_add_test (tc, test_query_missing_query);
   tcase_add_test (tc, test_query_bad_count);
   tcase_add_test (tc, test_query_options);
-  tcase_add_test (tc, test_query_private_cpu_server);
   tcase_add_test (tc, test_round_trip_with_indexer);
   suite_add_tcase (s, tc);
 

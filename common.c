@@ -10,13 +10,10 @@
 
 #include <errno.h>
 #include <error.h>
-#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
-
-bool embed_report_errors = true;
 
 void *
 xmalloc (size_t n)
@@ -80,369 +77,6 @@ buf_puts (struct buf *b, const char *s)
   buf_append (b, s, strlen (s));
 }
 
-/* Return the length of the valid UTF-8 sequence starting at S, which
-   has N bytes available, or 0 if it is not valid.  Overlong forms,
-   UTF-16 surrogates and values above U+10FFFF are not valid.  */
-static size_t
-utf8_len (const unsigned char *s, size_t n)
-{
-  size_t len, i;
-  unsigned char lo = 0x80, hi = 0xbf;  /* Range of the second byte.  */
-
-  if (s[0] < 0x80)
-    return 1;
-  else if (s[0] >= 0xc2 && s[0] <= 0xdf)
-    len = 2;
-  else if (s[0] >= 0xe0 && s[0] <= 0xef)
-    {
-      len = 3;
-      if (s[0] == 0xe0)
-        lo = 0xa0;
-      else if (s[0] == 0xed)
-        hi = 0x9f;
-    }
-  else if (s[0] >= 0xf0 && s[0] <= 0xf4)
-    {
-      len = 4;
-      if (s[0] == 0xf0)
-        lo = 0x90;
-      else if (s[0] == 0xf4)
-        hi = 0x8f;
-    }
-  else
-    return 0;
-
-  if (len > n || s[1] < lo || s[1] > hi)
-    return 0;
-  for (i = 2; i < len; i++)
-    if ((s[i] & 0xc0) != 0x80)
-      return 0;
-  return len;
-}
-
-/* Append S to B as a JSON string literal.  Invalid UTF-8 and control
-   characters are replaced so that the server always accepts it.  */
-static void
-buf_json_string (struct buf *b, const char *s)
-{
-  const unsigned char *p = (const unsigned char *) s;
-  size_t n = strlen (s);
-
-  buf_puts (b, "\"");
-  while (n > 0)
-    {
-      size_t len = utf8_len (p, n);
-
-      if (len == 0)
-        {
-          buf_puts (b, "?");
-          len = 1;
-        }
-      else if (*p == '"')
-        buf_puts (b, "\\\"");
-      else if (*p == '\\')
-        buf_puts (b, "\\\\");
-      else if (*p == '\n')
-        buf_puts (b, "\\n");
-      else if (*p < 0x20 || *p == 0x7f)
-        buf_puts (b, " ");
-      else
-        buf_append (b, (const char *) p, len);
-      p += len;
-      n -= len;
-    }
-  buf_puts (b, "\"");
-}
-
-/* Return P advanced past any JSON white space.  */
-static const char *
-skip_space (const char *p)
-{
-  while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
-    p++;
-  return p;
-}
-
-/* Find the first vector of the "embeddings" member in the JSON
-   response RESP, and return a pointer just past its opening bracket,
-   or NULL.  */
-static const char *
-find_vector (const char *resp)
-{
-  const char *p = strstr (resp, "\"embeddings\"");
-
-  if (!p)
-    return NULL;
-  p = skip_space (p + strlen ("\"embeddings\""));
-  if (*p++ != ':')
-    return NULL;
-  p = skip_space (p);
-  if (*p++ != '[')
-    return NULL;
-  p = skip_space (p);
-  if (*p++ != '[')
-    return NULL;
-  return p;
-}
-
-static size_t
-write_callback (char *ptr, size_t size, size_t nmemb, void *userdata)
-{
-  buf_append (userdata, ptr, size * nmemb);
-  return size * nmemb;
-}
-
-void
-embedder_init (struct embedder *e, const char *host, const char *model)
-{
-  struct buf url;
-
-  curl_global_init (CURL_GLOBAL_DEFAULT);
-  e->curl = curl_easy_init ();
-  if (!e->curl)
-    error (EXIT_FAILURE, 0, "cannot initialize libcurl");
-
-  buf_init (&url);
-  buf_puts (&url, host);
-  buf_puts (&url, "/api/embed");
-  e->url = url.data;
-  e->host = xstrdup (host);
-  e->model = xstrdup (model);
-}
-
-void
-embedder_free (struct embedder *e)
-{
-  curl_easy_cleanup (e->curl);
-  curl_global_cleanup ();
-  free (e->url);
-  free (e->host);
-  free (e->model);
-}
-
-bool
-embed_text (struct embedder *e, const char *text, long timeout,
-            float **vec, size_t *dim)
-{
-  struct buf req, resp;
-  struct curl_slist *headers = NULL;
-  CURLcode rc;
-  long status = 0;
-  bool ok = false;
-  const char *p;
-  float *v = NULL;
-  size_t n = 0, cap = 0;
-  double norm = 0;
-
-  buf_init (&req);
-  buf_init (&resp);
-  buf_puts (&req, "{\"model\":");
-  buf_json_string (&req, e->model);
-  buf_puts (&req, ",\"keep_alive\":\"10m\",\"truncate\":true,\"input\":");
-  buf_json_string (&req, text);
-  buf_puts (&req, "}");
-
-  headers = curl_slist_append (headers, "Content-Type: application/json");
-  curl_easy_reset (e->curl);
-  curl_easy_setopt (e->curl, CURLOPT_URL, e->url);
-  curl_easy_setopt (e->curl, CURLOPT_HTTPHEADER, headers);
-  curl_easy_setopt (e->curl, CURLOPT_POSTFIELDS, req.data);
-  curl_easy_setopt (e->curl, CURLOPT_POSTFIELDSIZE, (long) req.len);
-  curl_easy_setopt (e->curl, CURLOPT_WRITEFUNCTION, write_callback);
-  curl_easy_setopt (e->curl, CURLOPT_WRITEDATA, &resp);
-  curl_easy_setopt (e->curl, CURLOPT_TIMEOUT, timeout);
-  curl_easy_setopt (e->curl, CURLOPT_NOSIGNAL, 1L);
-
-  rc = curl_easy_perform (e->curl);
-  curl_slist_free_all (headers);
-  if (rc != CURLE_OK)
-    {
-      if (embed_report_errors)
-        error (0, 0, "embedding request failed: %s",
-               curl_easy_strerror (rc));
-      goto out;
-    }
-  curl_easy_getinfo (e->curl, CURLINFO_RESPONSE_CODE, &status);
-
-  p = find_vector (resp.data);
-  if (status != 200 || !p)
-    {
-      if (embed_report_errors)
-        error (0, 0, "embedding server returned %ld: %.200s", status,
-               resp.data);
-      goto out;
-    }
-
-  /* Parse the comma-separated list of numbers in the first vector.  */
-  for (p = skip_space (p); *p != ']'; )
-    {
-      char *end;
-      float f = strtof (p, &end);
-
-      if (end == p)
-        break;
-      if (n == cap)
-        {
-          cap = cap ? 2 * cap : 1024;
-          v = xrealloc (v, cap * sizeof *v);
-        }
-      v[n++] = f;
-      norm += (double) f * f;
-      p = skip_space (end);
-      if (*p == ',')
-        p = skip_space (p + 1);
-      else if (*p != ']')
-        break;
-    }
-  if (n == 0 || *p != ']')
-    {
-      if (embed_report_errors)
-        error (0, 0, "malformed embedding response");
-      goto out;
-    }
-
-  norm = sqrt (norm);
-  if (norm > 0)
-    for (size_t i = 0; i < n; i++)
-      v[i] /= norm;
-
-  *vec = v;
-  *dim = n;
-  v = NULL;
-  ok = true;
-
- out:
-  free (v);
-  buf_free (&req);
-  buf_free (&resp);
-  return ok;
-}
-
-/* POST the JSON object BODY to PATH on E's server, and store the
-   response in *RESP and its status in *STATUS.  Give up after TIMEOUT
-   seconds, or if TIMEOUT is 0, after a minute without data.  */
-static bool
-post_json (struct embedder *e, const char *path, const char *body,
-           long timeout, long *status, struct buf *resp)
-{
-  struct buf url;
-  struct curl_slist *headers = NULL;
-  CURLcode rc;
-
-  buf_init (&url);
-  buf_puts (&url, e->host);
-  buf_puts (&url, path);
-  headers = curl_slist_append (headers, "Content-Type: application/json");
-  curl_easy_reset (e->curl);
-  curl_easy_setopt (e->curl, CURLOPT_URL, url.data);
-  curl_easy_setopt (e->curl, CURLOPT_HTTPHEADER, headers);
-  curl_easy_setopt (e->curl, CURLOPT_POSTFIELDS, body);
-  curl_easy_setopt (e->curl, CURLOPT_WRITEFUNCTION, write_callback);
-  curl_easy_setopt (e->curl, CURLOPT_WRITEDATA, resp);
-  curl_easy_setopt (e->curl, CURLOPT_NOSIGNAL, 1L);
-  if (timeout)
-    curl_easy_setopt (e->curl, CURLOPT_TIMEOUT, timeout);
-  else
-    {
-      curl_easy_setopt (e->curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
-      curl_easy_setopt (e->curl, CURLOPT_LOW_SPEED_TIME, 60L);
-    }
-  rc = curl_easy_perform (e->curl);
-  curl_slist_free_all (headers);
-  buf_free (&url);
-  if (rc != CURLE_OK)
-    {
-      error (0, 0, "request to %s%s failed: %s", e->host, path,
-             curl_easy_strerror (rc));
-      return false;
-    }
-  curl_easy_getinfo (e->curl, CURLINFO_RESPONSE_CODE, status);
-  return true;
-}
-
-/* Return the last line of the streamed response TEXT that is not
-   empty.  */
-static const char *
-last_line (const char *text)
-{
-  const char *end = text + strlen (text);
-  const char *start;
-
-  while (end > text && (end[-1] == '\n' || end[-1] == '\r'))
-    end--;
-  for (start = end; start > text && start[-1] != '\n'; start--)
-    continue;
-  return start;
-}
-
-bool
-ensure_model (struct embedder *e)
-{
-  struct buf req, resp;
-  long status = 0;
-  bool ok = false;
-  const char *last;
-
-  buf_init (&req);
-  buf_init (&resp);
-  buf_puts (&req, "{\"model\":");
-  buf_json_string (&req, e->model);
-  buf_puts (&req, "}");
-  if (!post_json (e, "/api/show", req.data, 30, &status, &resp))
-    goto out;
-  if (status == 200)
-    {
-      ok = true;
-      goto out;
-    }
-  if (status != 404)
-    {
-      error (0, 0, "cannot look up model %s: server returned %ld: %.200s",
-             e->model, status, resp.data);
-      goto out;
-    }
-
-  error (0, 0, "downloading model %s; this is needed only once",
-         e->model);
-  resp.len = 0;
-  resp.data[0] = '\0';
-  /* Ollama streams progress, which keeps the connection alive however
-     long the download takes, and ends with "success" or an error.  */
-  if (!post_json (e, "/api/pull", req.data, 0, &status, &resp))
-    goto out;
-  last = last_line (resp.data);
-  if (status == 200 && strstr (last, "\"status\":\"success\"")
-      && !strstr (last, "\"error\""))
-    ok = true;
-  else
-    error (0, 0, "cannot download model %s: server returned %ld: %.200s",
-           e->model, status, last);
-
- out:
-  buf_free (&req);
-  buf_free (&resp);
-  return ok;
-}
-
-const char *
-document_prefix (const char *model)
-{
-  if (strstr (model, "nomic"))
-    return "search_document: ";
-  return "";
-}
-
-const char *
-query_prefix (const char *model)
-{
-  if (strstr (model, "nomic"))
-    return "search_query: ";
-  if (strstr (model, "qwen3-embedding"))
-    return "Instruct: Given a short search query, retrieve the files "
-      "on a personal computer that best match it\nQuery: ";
-  return "";
-}
-
 void
 make_parent_dirs (const char *path)
 {
@@ -476,7 +110,7 @@ parse_positive (const char *s, long max, long *value)
 }
 
 char *
-store_path (void)
+data_path (const char *name)
 {
   const char *home = getenv ("HOME");
   struct buf b;
@@ -485,8 +119,15 @@ store_path (void)
     error (EXIT_FAILURE, 0, "HOME is not set");
   buf_init (&b);
   buf_puts (&b, home);
-  buf_puts (&b, "/.local/share/embed/embeddings.txt");
+  buf_puts (&b, "/.local/share/embed/");
+  buf_puts (&b, name);
   return b.data;
+}
+
+char *
+store_path (void)
+{
+  return data_path ("embeddings.txt");
 }
 
 bool

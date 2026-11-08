@@ -11,14 +11,16 @@
 
 #include <stdbool.h>
 #include <stddef.h>
-#include <curl/curl.h>
 
-#define PACKAGE_VERSION "0.1"
-/* The embedding model.  Both programs use it, and pull it into the
-   server's model store when it is missing.  */
-#ifndef EMBED_MODEL
-# define EMBED_MODEL "nomic-embed-text"
-#endif
+#define PACKAGE_VERSION "0.2"
+
+/* The embedding model, as named in the store's header.  */
+#define EMBED_MODEL "nomic-embed-text-v1.5"
+
+/* Prefixes that tell the model whether it is looking at a document or
+   a search query.  */
+#define DOCUMENT_PREFIX "search_document: "
+#define QUERY_PREFIX "search_query: "
 
 /* A growable byte buffer, always NUL terminated.  */
 struct buf
@@ -37,43 +39,15 @@ void *xmalloc (size_t n);
 void *xrealloc (void *p, size_t n);
 char *xstrdup (const char *s);
 
-/* Connection to an Ollama server.  */
-struct embedder
-{
-  CURL *curl;
-  char *host;
-  char *url;
-  char *model;
-};
-
-/* Whether embed_text reports failures on standard error.  */
-extern bool embed_report_errors;
-
-void embedder_init (struct embedder *e, const char *host, const char *model);
-void embedder_free (struct embedder *e);
-
-/* Embed TEXT, giving up after TIMEOUT seconds.  On success store a
-   freshly allocated, L2-normalized vector in *VEC and its length in
-   *DIM and return true.  */
-bool embed_text (struct embedder *e, const char *text, long timeout,
-                 float **vec, size_t *dim);
-
-/* Make sure the server has the model, pulling it from the Ollama
-   registry if it does not.  Report problems on standard error and
-   return false if the model is still unavailable.  */
-bool ensure_model (struct embedder *e);
-
-/* Model-specific prefixes that tell the model whether it is looking at
-   a document or a search query.  */
-const char *document_prefix (const char *model);
-const char *query_prefix (const char *model);
-
 /* Parse S as a whole decimal number from 1 to MAX and store it in
    *VALUE.  Return false if S is anything else.  */
 bool parse_positive (const char *s, long max, long *value);
 
 /* Create the missing directories leading up to PATH.  */
 void make_parent_dirs (const char *path);
+
+/* Return ~/.local/share/embed/NAME, freshly allocated.  */
+char *data_path (const char *name);
 
 /* Return the path of the embedding store, freshly allocated.  */
 char *store_path (void);

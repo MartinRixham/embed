@@ -1,4 +1,4 @@
-/* fake-http.c -- a stand-in for the Ollama HTTP API, for tests.
+/* fake-http.c -- a small file server, for testing downloads.
    Copyright (C) 2026 Martin Rixham
 
    This program is free software: you can redistribute it and/or modify
@@ -9,20 +9,16 @@
 #include "fake-http.h"
 
 #include <arpa/inet.h>
+#include <netinet/in.h>
 #include <signal.h>
 #include <stdbool.h>
-#include <netinet/in.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>
+#include <sys/prctl.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <unistd.h>
-
-const char *const fake_keywords[FAKE_DIM] = {
-  "sourdough", "invoice", "sonata", "quicksort",
-  "sunset", "secret", "alpha", "omega"
-};
 
 int
 fake_listen (int *port)
@@ -60,193 +56,93 @@ write_all (int fd, const char *s, size_t n)
 }
 
 static void
-respond (int fd, int status, const char *body)
+respond (int fd, const char *status, const char *extra, const char *body,
+         size_t len, size_t promised)
 {
-  char head[256];
+  char head[512];
 
-  snprintf (head, sizeof head,
-            "HTTP/1.1 %d X\r\nContent-Type: application/json\r\n"
-            "Content-Length: %zu\r\nConnection: close\r\n\r\n",
-            status, strlen (body));
+  snprintf (head, sizeof head, "HTTP/1.1 %s\r\n%sContent-Length: %zu\r\n"
+            "Connection: close\r\n\r\n", status, extra, promised);
   write_all (fd, head, strlen (head));
-  write_all (fd, body, strlen (body));
+  write_all (fd, body, len);
 }
 
-static size_t
-count_ci (const char *hay, const char *needle)
+/* Return the contents of PATH, and its length in *LEN, or NULL.  */
+static char *
+slurp (const char *path, size_t *len)
 {
-  size_t n = 0, m = strlen (needle);
+  FILE *f = fopen (path, "rb");
+  char *data;
+  long n;
 
-  for (const char *p = hay; *p; p++)
-    if (strncasecmp (p, needle, m) == 0)
-      n++;
-  return n;
+  if (!f)
+    return NULL;
+  fseek (f, 0, SEEK_END);
+  n = ftell (f);
+  rewind (f);
+  data = malloc (n + 1);
+  *len = fread (data, 1, n, f);
+  fclose (f);
+  return data;
 }
 
-/* Whether the model has been pulled, for FAKE_MODEL=missing.  */
-static bool pulled;
-
-/* Return true if FAKE_MODEL is STATE.  */
-static bool
-model_state (const char *state)
-{
-  const char *s = getenv ("FAKE_MODEL");
-  return s && strcmp (s, state) == 0;
-}
-
-static bool
-model_missing (void)
-{
-  return !pulled && (model_state ("missing") || model_state ("pullfail")
-                     || model_state ("pull500"));
-}
-
-/* Answer an /api/show request.  */
 static void
-show_response (int fd)
+handle (int fd, const char *dir)
 {
-  if (model_state ("showfail"))
-    respond (fd, 500, "{\"error\":\"show broke\"}");
-  else if (model_missing ())
-    respond (fd, 404, "{\"error\":\"model 'm' not found\"}");
-  else
-    respond (fd, 200, "{\"modelfile\":\"FROM m\"}");
-}
+  char req[4096], path[8192], *name, *end;
+  size_t got = 0, len;
+  char *data;
+  FILE *log;
 
-/* Answer an /api/pull request, streaming progress like Ollama.  */
-static void
-pull_response (int fd)
-{
-  if (model_state ("pull500"))
-    return respond (fd, 500, "{\"error\":\"registry unreachable\"}");
-  if (model_state ("pullfail"))
-    return respond (fd, 200, "{\"status\":\"pulling manifest\"}\n"
-                    "{\"error\":\"pull model manifest: file does not "
-                    "exist\"}\n");
-  pulled = true;
-  respond (fd, 200, "{\"status\":\"pulling manifest\"}\n"
-           "{\"status\":\"pulling 970aa74c0a90\",\"total\":274290656,"
-           "\"completed\":274290656}\n"
-           "{\"status\":\"verifying sha256 digest\"}\n"
-           "{\"status\":\"success\"}\n");
-}
-
-/* Answer an /api/embed request whose body is BODY.  */
-static void
-embed_response (int fd, const char *body)
-{
-  char out[1024];
-  size_t dim = strstr (body, "FAKE_DIM3") ? 3 : FAKE_DIM;
-  bool spaces = strstr (body, "FAKE_SPACES") != NULL;
-  size_t len;
-
-  if (model_missing ())
-    return respond (fd, 404, "{\"error\":\"model \\\"m\\\" not found, "
-                    "try pulling it first\"}");
-  if (strstr (body, "FAKE_500"))
-    return respond (fd, 500, "{\"error\":\"boom\"}");
-  if (strstr (body, "FAKE_TOOLONG"))
-    return respond (fd, 400, "{\"error\":\"the input length exceeds the "
-                    "context length\"}");
-  if (strstr (body, "FAKE_MALFORMED"))
-    return respond (fd, 200, "{\"model\":\"m\",\"embeddings\":[[0.1,0.2,");
-  if (strstr (body, "FAKE_EMPTY"))
-    return respond (fd, 200, "{\"model\":\"m\",\"embeddings\":[[]]}");
-  if (strstr (body, "FAKE_BADSEP"))
-    return respond (fd, 200, "{\"embeddings\":[[0.1;0.2;0.3]]}");
-  if (strstr (body, "FAKE_NOVEC"))
-    return respond (fd, 200, "{\"model\":\"m\"}");
-  if (strstr (body, "FAKE_SLOW"))
-    sleep (3);
-
-  len = snprintf (out, sizeof out, spaces
-                  ? "{\n  \"model\": \"m\",\n  \"embeddings\": [ [ "
-                  : "{\"model\":\"m\",\"embeddings\":[[");
-  for (size_t i = 0; i < dim; i++)
+  /* Read the request head; the client sends no body.  */
+  while (got < sizeof req - 1 && !strstr (req, "\r\n\r\n"))
     {
-      double v = strstr (body, "FAKE_ZERO") ? 0
-        : 0.05 + count_ci (body, fake_keywords[i]);
-      len += snprintf (out + len, sizeof out - len, "%s%g",
-                       i == 0 ? "" : spaces ? " , " : ",", v);
-    }
-  snprintf (out + len, sizeof out - len, spaces ? " ] ]\n}\n" : "]]}");
-  respond (fd, 200, out);
-}
-
-static void
-handle (int fd, const char *log)
-{
-  char *req = malloc (1);
-  size_t len = 0, cap = 1, need = 0;
-  char *body = NULL;
-  bool continued = false;
-
-  for (;;)
-    {
-      char chunk[65536];
-      ssize_t n;
-
-      if (body && len - (body - req) >= need)
-        break;
-      n = read (fd, chunk, sizeof chunk);
+      ssize_t n = read (fd, req + got, sizeof req - 1 - got);
       if (n <= 0)
-        break;
-      if (len + n + 1 > cap)
-        {
-          size_t off = body ? (size_t) (body - req) : 0;
-          cap = 2 * (len + n + 1);
-          req = realloc (req, cap);
-          if (body)
-            body = req + off;
-        }
-      memcpy (req + len, chunk, n);
-      len += n;
-      req[len] = '\0';
-
-      if (!body && (body = strstr (req, "\r\n\r\n")))
-        {
-          const char *cl = strcasestr (req, "Content-Length:");
-          need = cl ? strtoul (cl + strlen ("Content-Length:"), NULL, 10)
-            : 0;
-          body += 4;
-          /* libcurl waits for this before sending a large body.  */
-          if (!continued && strcasestr (req, "Expect: 100-continue"))
-            {
-              const char *cont = "HTTP/1.1 100 Continue\r\n\r\n";
-              write_all (fd, cont, strlen (cont));
-              continued = true;
-            }
-        }
+        return;
+      got += n;
+      req[got] = '\0';
     }
+  if (strncmp (req, "GET /", 5) != 0 || !(end = strchr (req + 4, ' ')))
+    return respond (fd, "400 Bad Request", "", "", 0, 0);
+  *end = '\0';
+  name = req + 5;
 
-  if (!body)
-    ;
-  else if (strncmp (req, "POST /api/embed", 15) == 0)
+  snprintf (path, sizeof path, "%s/requests.log", dir);
+  if ((log = fopen (path, "a")))
     {
-      if (log)
-        {
-          FILE *f = fopen (log, "a");
-          if (f)
-            {
-              fprintf (f, "%s\n----\n", body);
-              fclose (f);
-            }
-        }
-      embed_response (fd, body);
+      fprintf (log, "GET /%s\n", name);
+      fclose (log);
     }
-  else if (strncmp (req, "POST /api/show ", 15) == 0)
-    show_response (fd);
-  else if (strncmp (req, "POST /api/pull ", 15) == 0)
-    pull_response (fd);
-  else if (strstr (req, " /api/version "))
-    respond (fd, 200, "{\"version\":\"fake\"}");
+
+  if (strncmp (name, "redirect/", 9) == 0)
+    {
+      char location[4200];
+      snprintf (location, sizeof location, "Location: /%s\r\n", name + 9);
+      return respond (fd, "302 Found", location, "", 0, 0);
+    }
+  bool truncated = strncmp (name, "truncated/", 10) == 0;
+  bool stall = strncmp (name, "stall/", 6) == 0;
+  if (truncated)
+    name += 10;
+  if (stall)
+    name += 6;
+  snprintf (path, sizeof path, "%s/%s", dir, name);
+  if (!(data = slurp (path, &len)))
+    return respond (fd, "404 Not Found", "", "", 0, 0);
+  if (truncated || stall)
+    {
+      respond (fd, "200 OK", "", data, len / 2, len);
+      if (stall)
+        sleep (600);
+    }
   else
-    respond (fd, 404, "{\"error\":\"not found\"}");
-  free (req);
+    respond (fd, "200 OK", "", data, len, len);
+  free (data);
 }
 
 void
-fake_serve (int listen_fd, const char *log)
+fake_serve (int listen_fd, const char *dir)
 {
   /* A client that gave up must not kill the server.  */
   signal (SIGPIPE, SIG_IGN);
@@ -255,7 +151,18 @@ fake_serve (int listen_fd, const char *log)
       int fd = accept (listen_fd, NULL, NULL);
       if (fd < 0)
         continue;
-      handle (fd, log);
+      /* Serve each client in its own process, so that a stalled one
+         does not hold up the rest.  */
+      if (fork () == 0)
+        {
+          prctl (PR_SET_PDEATHSIG, SIGKILL);
+          close (listen_fd);
+          handle (fd, dir);
+          close (fd);
+          _exit (0);
+        }
       close (fd);
+      while (waitpid (-1, NULL, WNOHANG) > 0)
+        continue;
     }
 }

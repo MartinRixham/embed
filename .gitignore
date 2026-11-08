@@ -5,3 +5,6 @@ embed-query
 
 # Test build output.
 tests/build/
+
+# Tool for checking the tokenizer.
+tools/tokenize
