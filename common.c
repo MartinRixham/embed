@@ -9,7 +9,9 @@
 #include "common.h"
 
 #include <errno.h>
+#include <inttypes.h>
 #include <error.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -148,4 +150,46 @@ parse_header (const char *line, char *model, size_t model_size,
   model[len] = '\0';
   *dim = strtoul (d + strlen ("dim="), NULL, 10);
   return *dim > 0;
+}
+
+void
+write_hex_vector (FILE *f, const float *vec, size_t dim)
+{
+  for (size_t i = 0; i < dim; i++)
+    {
+      uint32_t u;
+      memcpy (&u, &vec[i], sizeof u);
+      fprintf (f, "%08" PRIx32, u);
+    }
+}
+
+/* One more than the value of each hex digit, and 0 for any other
+   byte.  */
+static const unsigned char hex_value[256] = {
+  ['0'] = 1, ['1'] = 2, ['2'] = 3, ['3'] = 4, ['4'] = 5,
+  ['5'] = 6, ['6'] = 7, ['7'] = 8, ['8'] = 9, ['9'] = 10,
+  ['a'] = 11, ['b'] = 12, ['c'] = 13, ['d'] = 14, ['e'] = 15, ['f'] = 16,
+  ['A'] = 11, ['B'] = 12, ['C'] = 13, ['D'] = 14, ['E'] = 15, ['F'] = 16
+};
+
+bool
+parse_hex_vector (const char *s, float *vec, size_t dim)
+{
+  const unsigned char *p = (const unsigned char *) s;
+
+  for (size_t i = 0; i < dim; i++, p += 8)
+    {
+      uint32_t u = 0;
+
+      /* A NUL is not a digit, so this never reads past the end.  */
+      for (int j = 0; j < 8; j++)
+        {
+          unsigned v = hex_value[p[j]];
+          if (!v)
+            return false;
+          u = u << 4 | (v - 1);
+        }
+      memcpy (&vec[i], &u, sizeof u);
+    }
+  return *p == '\n' || *p == '\0';
 }

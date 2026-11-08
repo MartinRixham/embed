@@ -749,7 +749,8 @@ START_TEST (test_write_record_format)
 
   ck_assert (write_record (f, "/a/b c", &st, v, 3));
   fclose (f);
-  ck_assert_str_eq (read_file (p), "1700000000 42\t/a/b c\t0.5 -0.25 1e-07\n");
+  ck_assert_str_eq (read_file (p), "1700000000 42\t/a/b c\t"
+                    "3f000000be80000033d6bf95\n");
 }
 END_TEST
 
@@ -930,16 +931,12 @@ START_TEST (test_index_vectors_are_unit_length)
   store = read_file (fx.store);
   line = strchr (store, '\n') + 1;
   line = strchr (strchr (line, '\t') + 1, '\t') + 1;
+  float v[FAKE_DIM];
   double norm = 0;
-  int n = 0;
-  for (char *end; *line != '\n'; line = end, n++)
-    {
-      double v = strtod (line, &end);
-      ck_assert_ptr_ne (end, line);
-      norm += v * v;
-    }
-  ck_assert_int_eq (n, FAKE_DIM);
-  ck_assert_double_eq_tol (norm, 1.0, 1e-3);
+  ck_assert (parse_hex_vector (line, v, FAKE_DIM));
+  for (int i = 0; i < FAKE_DIM; i++)
+    norm += (double) v[i] * v[i];
+  ck_assert_double_eq_tol (norm, 1.0, 1e-6);
 }
 END_TEST
 

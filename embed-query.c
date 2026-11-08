@@ -180,7 +180,7 @@ main (int argc, char **argv)
   struct latest *latest;
   size_t n_latest;
   long data_start;
-  float *qvec;
+  float *qvec, *vec;
   FILE *f;
   int c;
 
@@ -253,13 +253,13 @@ main (int argc, char **argv)
     error (EXIT_FAILURE, errno, "%s", store);
 
   matches = xmalloc (count * sizeof *matches);
+  vec = xmalloc (dim * sizeof *vec);
   for (size_t line_no = 1;
        (len = getline (&line, &line_size, f)) > 0; line_no++)
     {
       struct latest key, *newest;
-      char *path, *p, *end;
+      char *path, *p;
       double dot = 0;
-      size_t i;
 
       if (!(path = split_record (line, len, &p)))
         continue;
@@ -269,15 +269,11 @@ main (int argc, char **argv)
       if (!newest || newest->line != line_no)
         continue;
 
-      for (i = 0; i < dim; i++, p = end)
-        {
-          float v = strtof (p, &end);
-          if (end == p)
-            break;
-          dot += (double) v * qvec[i];
-        }
-      if (i == dim)
-        insert_match (matches, count, &used, path, dot);
+      if (!parse_hex_vector (p, vec, dim))
+        continue;
+      for (size_t i = 0; i < dim; i++)
+        dot += (double) vec[i] * qvec[i];
+      insert_match (matches, count, &used, path, dot);
     }
   fclose (f);
 
@@ -293,6 +289,7 @@ main (int argc, char **argv)
     free (latest[i].path);
   free (latest);
   free (matches);
+  free (vec);
   free (qvec);
   free (line);
   buf_free (&query);

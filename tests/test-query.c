@@ -18,6 +18,7 @@
 #include "testutil.h"
 
 #include <check.h>
+#include <inttypes.h>
 #include <stdarg.h>
 #include <sys/stat.h>
 
@@ -58,6 +59,22 @@ teardown (void)
   tmpdir_remove (fx.root);
 }
 
+/* Return the 8 hex digits that store V, in a static buffer.  */
+static const char *
+hex_float (float v)
+{
+  static char s[9];
+  uint32_t u;
+
+  memcpy (&u, &v, sizeof u);
+  snprintf (s, sizeof s, "%08" PRIx32, u);
+  return s;
+}
+
+/* The hex for (1, 0, 0, 0, 0, 0, 0, 0), as FAKE_DIM is 8.  */
+#define UNIT0 "3f800000" "00000000" "00000000" "00000000" \
+              "00000000" "00000000" "00000000" "00000000"
+
 /* Write a store for MODEL, with records given as pairs of a path and a
    keyword index (or -1 for a vector halfway between keywords 0 and 1),
    ending with NULL.  Each vector is a unit vector along its keyword's
@@ -81,8 +98,8 @@ make_store (const char *model, const char *path, ...)
 
       for (int i = 0; i < FAKE_DIM; i++)
         {
-          double v = k == -1 ? (i < 2 ? sqrt (0.5) : 0) : i == k;
-          n += snprintf (line + n, sizeof line - n, i ? " %g" : "%g", v);
+          float v = k == -1 ? (i < 2 ? sqrt (0.5) : 0) : i == k;
+          n += snprintf (line + n, sizeof line - n, "%s", hex_float (v));
         }
       buf_puts (&b, line);
       buf_puts (&b, "\n");
@@ -266,7 +283,7 @@ START_TEST (test_query_default_count)
   buf_puts (&b, line);
   for (int i = 0; i < 25; i++)
     {
-      snprintf (line, sizeof line, "1 1\t/f%02d\t1 0 0 0 0 0 0 0\n", i);
+      snprintf (line, sizeof line, "1 1\t/f%02d\t" UNIT0 "\n", i);
       buf_puts (&b, line);
     }
   write_file (fx.store, b.data, b.len);
@@ -308,11 +325,15 @@ START_TEST (test_query_skips_bad_lines)
             "# embed-index model=" EMBED_MODEL " dim=%d\n"
             "no tabs at all\n"
             "1 1\tonly one tab\n"
-            "1 1\t/short\t1 0 0\n"
-            "1 1\t/words\tone two three four five six seven eight\n"
-            "1 1\t/good\t1 0 0 0 0 0 0 0\n"
+            "1 1\t/short\t3f8000000000000000000000\n"
+            "1 1\t/long\t" UNIT0 "00000000\n"
+            "1 1\t/notdigits\t3f80000g" UNIT0 "\n"
+            "1 1\t/decimal\t1 0 0 0 0 0 0 0\n"
+            "1 1\t/spaced\t3f800000 00000000 00000000 00000000 "
+            "00000000 00000000 00000000 00000000\n"
+            "1 1\t/good\t" UNIT0 "\n"
             "\n"
-            "1 1\t/truncated\t1 0 0 0 0 0 0 0", FAKE_DIM);
+            "1 1\t/truncated\t" UNIT0, FAKE_DIM);
   write_file (fx.store, data, (size_t) -1);
   ck_assert_int_eq (run_query ("sourdough", NULL), 0);
   ck_assert_str_eq (out_text (), "/good\n");

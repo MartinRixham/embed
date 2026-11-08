@@ -11,6 +11,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdio.h>
 
 #define PACKAGE_VERSION "0.2"
 
@@ -56,5 +57,15 @@ char *store_path (void);
    (at most MODEL_SIZE bytes) and the dimension in *DIM.  */
 bool parse_header (const char *line, char *model, size_t model_size,
                    size_t *dim);
+
+/* Write the DIM floats of VEC to F, each as the 8 hex digits of its
+   IEEE 754 bit pattern, most significant first, with no separators.
+   This is exact, and much quicker to read back than decimal.  */
+void write_hex_vector (FILE *f, const float *vec, size_t dim);
+
+/* Decode a vector written by write_hex_vector from S into the DIM
+   floats of VEC.  Return false unless S holds exactly DIM * 8 hex
+   digits followed by a newline or the end of the string.  */
+bool parse_hex_vector (const char *s, float *vec, size_t dim);
 
 #endif /* EMBED_COMMON_H */

@@ -254,6 +254,55 @@ START_TEST (test_make_parent_dirs_blocked)
 }
 END_TEST
 
+START_TEST (test_hex_vector_round_trip)
+{
+  float in[] = { 0.5f, -0.25f, 1e-7f, 0.0f, -0.0f, 1.0f / 3, 3.4e38f,
+                 1e-45f };
+  size_t n = sizeof in / sizeof *in;
+  float out[sizeof in / sizeof *in];
+  char *text;
+  size_t len;
+  FILE *f = open_memstream (&text, &len);
+
+  write_hex_vector (f, in, n);
+  fclose (f);
+  ck_assert_uint_eq (len, 8 * n);
+  ck_assert (strncmp (text, "3f000000be80000033d6bf9500000000"
+                      "80000000", 40) == 0);
+  ck_assert (parse_hex_vector (text, out, n));
+  /* Bit for bit, including the sign of zero.  */
+  ck_assert (memcmp (in, out, sizeof in) == 0);
+  free (text);
+}
+END_TEST
+
+START_TEST (test_hex_vector_accepts_case_and_newline)
+{
+  float v[2];
+
+  ck_assert (parse_hex_vector ("3F800000BE800000\n", v, 2));
+  ck_assert_float_eq (v[0], 1.0f);
+  ck_assert_float_eq (v[1], -0.25f);
+  ck_assert (parse_hex_vector ("3f800000be800000", v, 2));
+  ck_assert (parse_hex_vector ("\n", v, 0));
+}
+END_TEST
+
+START_TEST (test_hex_vector_rejects)
+{
+  float v[2];
+
+  ck_assert (!parse_hex_vector ("3f800000", v, 2));             /* short */
+  ck_assert (!parse_hex_vector ("3f800000be8000", v, 2));       /* cut */
+  ck_assert (!parse_hex_vector ("3f800000be80000000", v, 2));   /* long */
+  ck_assert (!parse_hex_vector ("3f800000 be800000", v, 2));    /* space */
+  ck_assert (!parse_hex_vector ("3f80000gbe800000", v, 2));     /* digit */
+  ck_assert (!parse_hex_vector ("0x800000be800000", v, 2));
+  ck_assert (!parse_hex_vector ("3f800000be800000\t", v, 2));
+  ck_assert (!parse_hex_vector ("", v, 2));
+}
+END_TEST
+
 START_TEST (test_parse_positive)
 {
   long v = -7;
@@ -308,6 +357,9 @@ common_suite (void)
   tcase_add_test (tc, test_parse_header_invalid);
   tcase_add_test (tc, test_parse_header_model_too_long);
   tcase_add_test (tc, test_parse_positive);
+  tcase_add_test (tc, test_hex_vector_round_trip);
+  tcase_add_test (tc, test_hex_vector_accepts_case_and_newline);
+  tcase_add_test (tc, test_hex_vector_rejects);
   tcase_add_test (tc, test_make_parent_dirs);
   tcase_add_exit_test (tc, test_make_parent_dirs_blocked, EXIT_FAILURE);
   suite_add_tcase (s, tc);

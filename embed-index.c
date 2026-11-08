@@ -469,8 +469,7 @@ write_record (FILE *f, const char *file, const struct stat *st,
 {
   fprintf (f, "%lld %lld\t%s\t", (long long) st->st_mtime,
            (long long) st->st_size, file);
-  for (size_t i = 0; i < dim; i++)
-    fprintf (f, i ? " %.4g" : "%.4g", vec[i]);
+  write_hex_vector (f, vec, dim);
   putc ('\n', f);
   return fflush (f) == 0 && !ferror (f);
 }
