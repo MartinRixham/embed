@@ -6,8 +6,8 @@
    the Free Software Foundation, either version 3 of the License, or
    (at your option) any later version.
 
-   The query is embedded on the GPU by a private Ollama server, with
-   the same model that built the store, and
+   The query is embedded by a private Ollama server, with the same
+   model that built the store, and
    the store is scanned once, keeping the best matches by cosine
    similarity.  */
 
@@ -50,7 +50,7 @@ usage (int status)
           "  -s, --scores         show the similarity score of each match\n"
           "  -H, --host=URL       use the Ollama server at URL instead of "
           "starting\n"
-          "                       a private one on the GPU\n"
+          "                       a private one\n"
           "      --help           display this help and exit\n"
           "      --version        output version information and exit\n\n"
           "Run embed-index first to build the store.\n");
@@ -151,9 +151,11 @@ main (int argc, char **argv)
       buf_puts (&query, argv[i]);
     }
 
+  /* A single short query is quicker on the CPU than it takes the GPU
+     just to initialize.  */
   if (!host)
     {
-      server_start (&srv);
+      server_start (&srv, false);
       host = srv.url;
     }
   embedder_init (&emb, host, model);

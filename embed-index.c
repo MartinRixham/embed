@@ -602,7 +602,7 @@ main (int argc, char **argv)
 
   if (!host)
     {
-      server_start (&srv);
+      server_start (&srv, true);
       host = srv.url;
     }
   embedder_init (&emb, host, store_model);

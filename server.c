@@ -8,8 +8,8 @@
 
    Rather than relying on a system-wide Ollama service, which may be
    absent or configured to run on the CPU, each program starts its own
-   "ollama serve" on a free loopback port with the Vulkan backend
-   enabled, and stops it on exit.  The server runs in its own process
+   "ollama serve" on a free loopback port, using either the GPU
+   through Vulkan or only the CPU, and stops it on exit.  The server runs in its own process
    group, so that Ctrl-C reaches only the parent, which can then finish
    cleanly; and it is told to exit if the parent dies.  */
 
@@ -72,7 +72,7 @@ log_path (void)
 /* Set up the environment of the server process and run it.  Only
    called in the child.  */
 static void
-exec_server (const char *host, const char *log, pid_t parent)
+exec_server (const char *host, const char *log, pid_t parent, bool use_gpu)
 {
   struct stat st;
   int fd;
@@ -92,10 +92,23 @@ exec_server (const char *host, const char *log, pid_t parent)
     }
 
   setenv ("OLLAMA_HOST", host, 1);
-  /* Use the GPU, including integrated ones, through Vulkan.  */
-  setenv ("OLLAMA_VULKAN", "1", 1);
-  setenv ("OLLAMA_IGPU_ENABLE", "1", 1);
-  unsetenv ("GGML_VK_VISIBLE_DEVICES");
+  if (use_gpu)
+    {
+      /* Use the GPU, including integrated ones, through Vulkan.  */
+      setenv ("OLLAMA_VULKAN", "1", 1);
+      setenv ("OLLAMA_IGPU_ENABLE", "1", 1);
+      unsetenv ("GGML_VK_VISIBLE_DEVICES");
+    }
+  else
+    {
+      /* Hide every GPU, which also skips their slow initialization.  */
+      setenv ("OLLAMA_VULKAN", "0", 1);
+      setenv ("OLLAMA_IGPU_ENABLE", "0", 1);
+      setenv ("GGML_VK_VISIBLE_DEVICES", "-1", 1);
+      setenv ("CUDA_VISIBLE_DEVICES", "-1", 1);
+      setenv ("HIP_VISIBLE_DEVICES", "-1", 1);
+      setenv ("ROCR_VISIBLE_DEVICES", "-1", 1);
+    }
   /* Share the models of the system service when there is one; never
      delete anything from that store.  */
   if (!getenv ("OLLAMA_MODELS") && stat (SYSTEM_MODELS, &st) == 0)
@@ -132,7 +145,7 @@ server_ready (CURL *curl, const char *url)
 }
 
 void
-server_start (struct server *s)
+server_start (struct server *s, bool use_gpu)
 {
   char *log = log_path ();
   char host[32];
@@ -148,7 +161,7 @@ server_start (struct server *s)
   if (s->pid < 0)
     error (EXIT_FAILURE, errno, "fork");
   if (s->pid == 0)
-    exec_server (host, log, parent);
+    exec_server (host, log, parent, use_gpu);
   /* Also set the group here, so that server_stop can signal it even if
      the child has not got that far yet.  */
   setpgid (s->pid, s->pid);

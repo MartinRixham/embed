@@ -20,11 +20,13 @@ struct server
   char url[64];                 /* Base URL, such as http://127.0.0.1:N.  */
 };
 
-/* Start a private server listening on a free loopback port, with the
-   Vulkan GPU backend enabled.  Its output goes to the log file
+/* Start a private server listening on a free loopback port.  If
+   USE_GPU, run models on the GPU through Vulkan; otherwise on the CPU,
+   which starts several seconds sooner and so suits a single short
+   embedding.  Its output goes to the log file
    ~/.local/state/embed/ollama.log.  Exit with a diagnostic if it does
    not become ready.  */
-void server_start (struct server *s);
+void server_start (struct server *s, bool use_gpu);
 
 /* Stop S and the model runners it started.  */
 void server_stop (struct server *s);
