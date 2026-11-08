@@ -1,0 +1,70 @@
+/* common.h -- shared declarations for embed-index and embed-query.
+   Copyright (C) 2026 Martin Rixham
+
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.  */
+
+#ifndef EMBED_COMMON_H
+#define EMBED_COMMON_H
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <curl/curl.h>
+
+#define PACKAGE_VERSION "0.1"
+#define DEFAULT_MODEL "nomic-embed-text"
+#define DEFAULT_HOST "http://localhost:11434"
+
+/* A growable byte buffer, always NUL terminated.  */
+struct buf
+{
+  char *data;
+  size_t len;
+  size_t cap;
+};
+
+void buf_init (struct buf *b);
+void buf_free (struct buf *b);
+void buf_append (struct buf *b, const char *s, size_t n);
+void buf_puts (struct buf *b, const char *s);
+
+void *xmalloc (size_t n);
+void *xrealloc (void *p, size_t n);
+char *xstrdup (const char *s);
+
+/* Connection to an Ollama server.  */
+struct embedder
+{
+  CURL *curl;
+  char *url;
+  char *model;
+};
+
+/* Whether embed_text reports failures on standard error.  */
+extern bool embed_report_errors;
+
+void embedder_init (struct embedder *e, const char *host, const char *model);
+void embedder_free (struct embedder *e);
+
+/* Embed TEXT, giving up after TIMEOUT seconds.  On success store a
+   freshly allocated, L2-normalized vector in *VEC and its length in
+   *DIM and return true.  */
+bool embed_text (struct embedder *e, const char *text, long timeout,
+                 float **vec, size_t *dim);
+
+/* Model-specific prefixes that tell the model whether it is looking at
+   a document or a search query.  */
+const char *document_prefix (const char *model);
+const char *query_prefix (const char *model);
+
+/* Return the path of the embedding store, freshly allocated.  */
+char *store_path (void);
+
+/* Parse the store header line LINE.  Store the model name in MODEL
+   (at most MODEL_SIZE bytes) and the dimension in *DIM.  */
+bool parse_header (const char *line, char *model, size_t model_size,
+                   size_t *dim);
+
+#endif /* EMBED_COMMON_H */
