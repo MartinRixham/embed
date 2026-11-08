@@ -58,6 +58,10 @@ bool embed_text (struct embedder *e, const char *text, long timeout,
 const char *document_prefix (const char *model);
 const char *query_prefix (const char *model);
 
+/* Parse S as a whole decimal number from 1 to MAX and store it in
+   *VALUE.  Return false if S is anything else.  */
+bool parse_positive (const char *s, long max, long *value);
+
 /* Create the missing directories leading up to PATH.  */
 void make_parent_dirs (const char *path);
 

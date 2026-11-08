@@ -2,3 +2,6 @@
 *.o
 embed-index
 embed-query
+
+# Test build output.
+tests/build/

@@ -58,23 +58,12 @@ usage (int status)
 }
 
 /* Insert PATH with SCORE into the N best MATCHES, which hold *USED
-   entries sorted best first.  A path already present is replaced,
-   since later records in the store supersede earlier ones.  */
+   entries sorted best first.  */
 static void
 insert_match (struct match *matches, size_t n, size_t *used,
               const char *path, float score)
 {
   size_t i;
-
-  for (i = 0; i < *used; i++)
-    if (strcmp (matches[i].path, path) == 0)
-      {
-        free (matches[i].path);
-        memmove (matches + i, matches + i + 1,
-                 (*used - i - 1) * sizeof *matches);
-        (*used)--;
-        break;
-      }
 
   if (*used == n && score <= matches[n - 1].score)
     return;
@@ -86,6 +75,97 @@ insert_match (struct match *matches, size_t n, size_t *used,
   matches[i].score = score;
   matches[i].path = xstrdup (path);
   (*used)++;
+}
+
+/* The line number of the newest record for a path.  */
+struct latest
+{
+  char *path;
+  size_t line;
+};
+
+static int
+compare_latest (const void *a, const void *b)
+{
+  const struct latest *x = a, *y = b;
+  int c = strcmp (x->path, y->path);
+
+  if (c != 0)
+    return c;
+  return (x->line > y->line) - (x->line < y->line);
+}
+
+static int
+compare_paths (const void *a, const void *b)
+{
+  const struct latest *x = a, *y = b;
+  return strcmp (x->path, y->path);
+}
+
+/* If LINE, of LEN bytes, is a complete record, end its path with a NUL
+   and return the path; store the start of its vector in *VEC.
+   Otherwise return NULL.  */
+static char *
+split_record (char *line, ssize_t len, char **vec)
+{
+  char *path, *p;
+
+  if (len <= 0 || line[len - 1] != '\n')
+    return NULL;
+  path = strchr (line, '\t');
+  if (!path)
+    return NULL;
+  path++;
+  p = strchr (path, '\t');
+  if (!p)
+    return NULL;
+  *p = '\0';
+  *vec = p + 1;
+  return path;
+}
+
+/* Read the records of F, from the current position to the end, and
+   return the newest record for each path, sorted by path.  Line
+   numbers count from 1 at the current position.  Store the number of
+   paths in *N.  */
+static struct latest *
+find_latest (FILE *f, size_t *n)
+{
+  struct latest *v = NULL;
+  size_t used = 0, cap = 0, out = 0, line_no = 0, line_size = 0;
+  char *line = NULL, *path, *vec;
+  ssize_t len;
+
+  while ((len = getline (&line, &line_size, f)) > 0)
+    {
+      line_no++;
+      if (!(path = split_record (line, len, &vec)))
+        continue;
+      if (used == cap)
+        {
+          cap = cap ? 2 * cap : 1024;
+          v = xrealloc (v, cap * sizeof *v);
+        }
+      v[used].path = xstrdup (path);
+      v[used].line = line_no;
+      used++;
+    }
+  free (line);
+
+  if (used > 0)
+    qsort (v, used, sizeof *v, compare_latest);
+  for (size_t i = 0; i < used; i++)
+    {
+      if (out > 0 && strcmp (v[out - 1].path, v[i].path) == 0)
+        {
+          free (v[out - 1].path);
+          v[out - 1] = v[i];
+        }
+      else
+        v[out++] = v[i];
+    }
+  *n = out;
+  return v;
 }
 
 int
@@ -103,6 +183,9 @@ main (int argc, char **argv)
   struct buf query;
   struct embedder emb;
   struct match *matches;
+  struct latest *latest;
+  size_t n_latest;
+  long data_start;
   float *qvec;
   FILE *f;
   int c;
@@ -111,9 +194,12 @@ main (int argc, char **argv)
     switch (c)
       {
       case 'n':
-        count = strtoul (optarg, NULL, 10);
-        if (count == 0)
-          error (EXIT_FAILURE, 0, "invalid count: %s", optarg);
+        {
+          long n;
+          if (!parse_positive (optarg, 1000000, &n))
+            error (EXIT_FAILURE, 0, "invalid count: %s", optarg);
+          count = n;
+        }
         break;
       case 'H':
         host = optarg;
@@ -168,23 +254,31 @@ main (int argc, char **argv)
     error (EXIT_FAILURE, 0, "query has dimension %zu but store has %zu",
            qdim, dim);
 
+  /* A path can have several records, if an interrupted indexing run
+     left them, or one is in progress: only the newest counts.  Find
+     those first, so that a stale record cannot take the place of a
+     better match.  */
+  data_start = ftell (f);
+  latest = find_latest (f, &n_latest);
+  if (fseek (f, data_start, SEEK_SET) != 0)
+    error (EXIT_FAILURE, errno, "%s", store);
+
   matches = xmalloc (count * sizeof *matches);
-  while ((len = getline (&line, &line_size, f)) > 0)
+  for (size_t line_no = 1;
+       (len = getline (&line, &line_size, f)) > 0; line_no++)
     {
+      struct latest key, *newest;
       char *path, *p, *end;
       double dot = 0;
       size_t i;
 
-      if (line[len - 1] != '\n')
+      if (!(path = split_record (line, len, &p)))
         continue;
-      path = strchr (line, '\t');
-      if (!path)
+      key.path = path;
+      newest = n_latest ? bsearch (&key, latest, n_latest, sizeof *latest,
+                                   compare_paths) : NULL;
+      if (!newest || newest->line != line_no)
         continue;
-      path++;
-      p = strchr (path, '\t');
-      if (!p)
-        continue;
-      *p++ = '\0';
 
       for (i = 0; i < dim; i++, p = end)
         {
@@ -206,6 +300,9 @@ main (int argc, char **argv)
       free (matches[i].path);
     }
 
+  for (size_t i = 0; i < n_latest; i++)
+    free (latest[i].path);
+  free (latest);
   free (matches);
   free (qvec);
   free (line);

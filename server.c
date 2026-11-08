@@ -36,7 +36,9 @@
 #define SYSTEM_MODELS "/var/lib/ollama/.ollama/models"
 
 /* How long to wait for the server to accept requests, in seconds.  */
-#define START_TIMEOUT 30
+#ifndef START_TIMEOUT
+# define START_TIMEOUT 30
+#endif
 
 /* Return a loopback TCP port that is currently free.  */
 static int
@@ -119,7 +121,8 @@ exec_server (const char *host, const char *log, pid_t parent, bool use_gpu)
   setenv ("OLLAMA_KEEP_ALIVE", "-1", 1);
 
   execlp ("ollama", "ollama", "serve", (char *) NULL);
-  fprintf (stderr, "cannot run ollama: %s\n", strerror (errno));
+  /* Not through stdio, whose buffer _exit would discard.  */
+  dprintf (STDERR_FILENO, "cannot run ollama: %s\n", strerror (errno));
   _exit (127);
 }
 

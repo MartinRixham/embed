@@ -81,26 +81,40 @@ buf_puts (struct buf *b, const char *s)
 }
 
 /* Return the length of the valid UTF-8 sequence starting at S, which
-   has N bytes available, or 0 if it is not valid.  */
+   has N bytes available, or 0 if it is not valid.  Overlong forms,
+   UTF-16 surrogates and values above U+10FFFF are not valid.  */
 static size_t
 utf8_len (const unsigned char *s, size_t n)
 {
   size_t len, i;
+  unsigned char lo = 0x80, hi = 0xbf;  /* Range of the second byte.  */
 
   if (s[0] < 0x80)
     return 1;
-  else if ((s[0] & 0xe0) == 0xc0 && s[0] >= 0xc2)
+  else if (s[0] >= 0xc2 && s[0] <= 0xdf)
     len = 2;
-  else if ((s[0] & 0xf0) == 0xe0)
-    len = 3;
-  else if ((s[0] & 0xf8) == 0xf0 && s[0] <= 0xf4)
-    len = 4;
+  else if (s[0] >= 0xe0 && s[0] <= 0xef)
+    {
+      len = 3;
+      if (s[0] == 0xe0)
+        lo = 0xa0;
+      else if (s[0] == 0xed)
+        hi = 0x9f;
+    }
+  else if (s[0] >= 0xf0 && s[0] <= 0xf4)
+    {
+      len = 4;
+      if (s[0] == 0xf0)
+        lo = 0x90;
+      else if (s[0] == 0xf4)
+        hi = 0x8f;
+    }
   else
     return 0;
 
-  if (len > n)
+  if (len > n || s[1] < lo || s[1] > hi)
     return 0;
-  for (i = 1; i < len; i++)
+  for (i = 2; i < len; i++)
     if ((s[i] & 0xc0) != 0x80)
       return 0;
   return len;
@@ -138,6 +152,37 @@ buf_json_string (struct buf *b, const char *s)
       n -= len;
     }
   buf_puts (b, "\"");
+}
+
+/* Return P advanced past any JSON white space.  */
+static const char *
+skip_space (const char *p)
+{
+  while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
+    p++;
+  return p;
+}
+
+/* Find the first vector of the "embeddings" member in the JSON
+   response RESP, and return a pointer just past its opening bracket,
+   or NULL.  */
+static const char *
+find_vector (const char *resp)
+{
+  const char *p = strstr (resp, "\"embeddings\"");
+
+  if (!p)
+    return NULL;
+  p = skip_space (p + strlen ("\"embeddings\""));
+  if (*p++ != ':')
+    return NULL;
+  p = skip_space (p);
+  if (*p++ != '[')
+    return NULL;
+  p = skip_space (p);
+  if (*p++ != '[')
+    return NULL;
+  return p;
 }
 
 static size_t
@@ -217,7 +262,7 @@ embed_text (struct embedder *e, const char *text, long timeout,
     }
   curl_easy_getinfo (e->curl, CURLINFO_RESPONSE_CODE, &status);
 
-  p = strstr (resp.data, "\"embeddings\":[[");
+  p = find_vector (resp.data);
   if (status != 200 || !p)
     {
       if (embed_report_errors)
@@ -227,8 +272,7 @@ embed_text (struct embedder *e, const char *text, long timeout,
     }
 
   /* Parse the comma-separated list of numbers in the first vector.  */
-  p += strlen ("\"embeddings\":[[");
-  while (*p && *p != ']')
+  for (p = skip_space (p); *p != ']'; )
     {
       char *end;
       float f = strtof (p, &end);
@@ -242,9 +286,11 @@ embed_text (struct embedder *e, const char *text, long timeout,
         }
       v[n++] = f;
       norm += (double) f * f;
-      p = end;
+      p = skip_space (end);
       if (*p == ',')
-        p++;
+        p = skip_space (p + 1);
+      else if (*p != ']')
+        break;
     }
   if (n == 0 || *p != ']')
     {
@@ -303,6 +349,22 @@ make_parent_dirs (const char *path)
         *p = '/';
       }
   free (copy);
+}
+
+bool
+parse_positive (const char *s, long max, long *value)
+{
+  char *end;
+  long v;
+
+  if (*s < '0' || *s > '9')
+    return false;
+  errno = 0;
+  v = strtol (s, &end, 10);
+  if (errno != 0 || *end != '\0' || v < 1 || v > max)
+    return false;
+  *value = v;
+  return true;
 }
 
 char *

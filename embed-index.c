@@ -56,6 +56,9 @@ static size_t n_entries;
 static char *keep;
 static size_t n_lines, keep_cap;
 
+/* Whether the store ends in a partial line, left by a crash.  */
+static bool store_unterminated;
+
 static volatile sig_atomic_t interrupted;
 static bool verbose;
 static bool include_hidden;
@@ -172,6 +175,7 @@ load_store (const char *path, char *model, size_t model_size)
   if (len <= 0 || !parse_header (line, model, model_size, &dim))
     error (EXIT_FAILURE, 0, "%s: missing or invalid header", path);
   keep_push (1);
+  store_unterminated = line[len - 1] != '\n';
 
   while ((len = getline (&line, &line_size, f)) > 0)
     {
@@ -179,7 +183,8 @@ load_store (const char *path, char *model, size_t model_size)
       char *p = line, *tab1, *tab2;
 
       keep_push (0);
-      if (line[len - 1] != '\n')
+      store_unterminated = line[len - 1] != '\n';
+      if (store_unterminated)
         continue;                       /* Truncated by a crash.  */
       if (sscanf (p, "%lld %lld", &mtime, &size) != 2
           || !(tab1 = strchr (p, '\t'))
@@ -203,7 +208,8 @@ load_store (const char *path, char *model, size_t model_size)
   fclose (f);
 
   /* Sort by path and keep only the newest record for each.  */
-  qsort (entries, n_entries, sizeof *entries, compare_entries);
+  if (n_entries > 0)
+    qsort (entries, n_entries, sizeof *entries, compare_entries);
   size_t out = 0;
   for (size_t i = 0; i < n_entries; i++)
     {
@@ -452,6 +458,24 @@ describe_file (magic_t magic_mime, magic_t magic_desc, const char *file,
     }
 }
 
+/* Embed TEXT like embed_text, but fail unless the vector has DIM
+   dimensions, so that the store stays consistent.  */
+static bool
+embed_checked (struct embedder *e, const char *text, long timeout,
+               size_t dim, float **vec)
+{
+  size_t d;
+
+  if (!embed_text (e, text, timeout, vec, &d))
+    return false;
+  if (d == dim)
+    return true;
+  if (embed_report_errors)
+    error (0, 0, "model returned %zu dimensions instead of %zu", d, dim);
+  free (*vec);
+  return false;
+}
+
 /* Write a store record for FILE to F and return true on success.  */
 static bool
 write_record (FILE *f, const char *file, const struct stat *st,
@@ -551,8 +575,7 @@ main (int argc, char **argv)
         model_opt = optarg;
         break;
       case 't':
-        embed_timeout = strtol (optarg, NULL, 10);
-        if (embed_timeout <= 0)
+        if (!parse_positive (optarg, 3600, &embed_timeout))
           error (EXIT_FAILURE, 0, "invalid timeout: %s", optarg);
         break;
       case 'v':
@@ -615,7 +638,12 @@ main (int argc, char **argv)
   free (vec);
 
   if (have_store)
-    out = fopen (store, "a");
+    {
+      out = fopen (store, "a");
+      /* End a partial line, so that new records do not run into it.  */
+      if (out && store_unterminated)
+        putc ('\n', out);
+    }
   else
     {
       make_parent_dirs (store);
@@ -650,7 +678,6 @@ main (int argc, char **argv)
     {
       struct entry *e;
       struct buf text;
-      size_t d;
 
       if (ent->fts_level > 0 && ent->fts_name[0] == '.' && !include_hidden)
         {
@@ -685,21 +712,19 @@ main (int argc, char **argv)
       buf_init (&text);
       describe_file (magic_mime, magic_desc, ent->fts_path, home,
                      store_model, true, &text);
-      bool ok = embed_text (&emb, text.data, embed_timeout, &vec, &d);
+      bool ok = embed_checked (&emb, text.data, embed_timeout, dim, &vec);
       if (!ok && !interrupted)
         {
           /* Fall back to embedding just the name and type.  */
           text.len = 0;
           describe_file (magic_mime, magic_desc, ent->fts_path, home,
                          store_model, false, &text);
-          ok = embed_text (&emb, text.data, FALLBACK_TIMEOUT, &vec, &d);
+          ok = embed_checked (&emb, text.data, FALLBACK_TIMEOUT, dim, &vec);
         }
       buf_free (&text);
 
-      if (!ok || d != dim)
+      if (!ok)
         {
-          if (ok)
-            free (vec);
           n_failed++;
           error (0, 0, "%s: could not embed", ent->fts_path);
           continue;
