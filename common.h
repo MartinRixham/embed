@@ -15,7 +15,6 @@
 
 #define PACKAGE_VERSION "0.1"
 #define DEFAULT_MODEL "nomic-embed-text"
-#define DEFAULT_HOST "http://localhost:11434"
 
 /* A growable byte buffer, always NUL terminated.  */
 struct buf
@@ -58,6 +57,9 @@ bool embed_text (struct embedder *e, const char *text, long timeout,
    a document or a search query.  */
 const char *document_prefix (const char *model);
 const char *query_prefix (const char *model);
+
+/* Create the missing directories leading up to PATH.  */
+void make_parent_dirs (const char *path);
 
 /* Return the path of the embedding store, freshly allocated.  */
 char *store_path (void);

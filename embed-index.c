@@ -9,12 +9,14 @@
    Each file is turned into a short text description (its name,
    location, type and, where possible, its content: plain text, PDF
    text, office document text, OCR of images, or audio/video metadata)
-   and that text is embedded by a local Ollama model.  The results are
+   and that text is embedded by a model running on the GPU in a private
+   Ollama server that this program starts and stops itself.  The results are
    appended to ~/.local/share/embed/embeddings.txt, one file per line.
    Files whose size and modification time are unchanged since the last
    run are skipped, so the program can be rerun cheaply.  */
 
 #include "common.h"
+#include "server.h"
 
 #include <errno.h>
 #include <error.h>
@@ -83,7 +85,9 @@ usage (int status)
           "Embed every file under each DIRECTORY (default: $HOME) with a "
           "local model.\n\n"
           "  -a, --all            include hidden files and directories\n"
-          "  -H, --host=URL       Ollama server (default %s)\n"
+          "  -H, --host=URL       use the Ollama server at URL instead of "
+          "starting\n"
+          "                       a private one on the GPU\n"
           "  -m, --model=NAME     embedding model (default: the model of "
           "the\n"
           "                       existing store, or %s)\n"
@@ -93,7 +97,7 @@ usage (int status)
           "      --help           display this help and exit\n"
           "      --version        output version information and exit\n\n"
           "Embeddings are stored in ~/.local/share/embed/embeddings.txt.\n",
-          DEFAULT_HOST, DEFAULT_MODEL, embed_timeout);
+          DEFAULT_MODEL, embed_timeout);
   exit (status);
 }
 
@@ -511,26 +515,11 @@ compact_store (const char *path)
   buf_free (&tmp_path);
 }
 
-static void
-make_parent_dirs (const char *path)
-{
-  char *copy = xstrdup (path);
-
-  for (char *p = copy + 1; *p; p++)
-    if (*p == '/')
-      {
-        *p = '\0';
-        if (mkdir (copy, 0755) != 0 && errno != EEXIST)
-          error (EXIT_FAILURE, errno, "cannot create %s", copy);
-        *p = '/';
-      }
-  free (copy);
-}
-
 int
 main (int argc, char **argv)
 {
-  const char *host = DEFAULT_HOST;
+  const char *host = NULL;
+  struct server srv = { 0 };
   const char *model_opt = NULL;
   char store_model[256];
   char *store = store_path ();
@@ -611,13 +600,18 @@ main (int argc, char **argv)
     snprintf (store_model, sizeof store_model, "%s",
               model_opt ? model_opt : DEFAULT_MODEL);
 
+  if (!host)
+    {
+      server_start (&srv);
+      host = srv.url;
+    }
   embedder_init (&emb, host, store_model);
 
   /* Warm up the model, which may take a while to load, and learn its
      dimension.  */
   if (!embed_text (&emb, "warm up", 120, &vec, &dim))
-    error (EXIT_FAILURE, 0, "cannot reach model %s at %s; is ollama "
-           "running and the model pulled?", store_model, host);
+    error (EXIT_FAILURE, 0, "cannot load model %s at %s; has it been "
+           "pulled with 'ollama pull %s'?", store_model, host, store_model);
   free (vec);
 
   if (have_store)
@@ -728,6 +722,8 @@ main (int argc, char **argv)
   if (!verbose && isatty (STDERR_FILENO))
     fputc ('\n', stderr);
   fts_close (fts);
+  embedder_free (&emb);
+  server_stop (&srv);
   if (fclose (out) != 0)
     error (EXIT_FAILURE, errno, "%s", store);
 
@@ -749,6 +745,5 @@ main (int argc, char **argv)
 
   magic_close (magic_mime);
   magic_close (magic_desc);
-  embedder_free (&emb);
   return interrupted ? 130 : EXIT_SUCCESS;
 }

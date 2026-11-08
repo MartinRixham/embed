@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 bool embed_report_errors = true;
 
@@ -286,6 +287,22 @@ query_prefix (const char *model)
     return "Instruct: Given a short search query, retrieve the files "
       "on a personal computer that best match it\nQuery: ";
   return "";
+}
+
+void
+make_parent_dirs (const char *path)
+{
+  char *copy = xstrdup (path);
+
+  for (char *p = copy + 1; *p; p++)
+    if (*p == '/')
+      {
+        *p = '\0';
+        if (mkdir (copy, 0755) != 0 && errno != EEXIST)
+          error (EXIT_FAILURE, errno, "cannot create %s", copy);
+        *p = '/';
+      }
+  free (copy);
 }
 
 char *

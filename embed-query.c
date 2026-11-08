@@ -6,11 +6,13 @@
    the Free Software Foundation, either version 3 of the License, or
    (at your option) any later version.
 
-   The query is embedded with the same model that built the store, and
+   The query is embedded on the GPU by a private Ollama server, with
+   the same model that built the store, and
    the store is scanned once, keeping the best matches by cosine
    similarity.  */
 
 #include "common.h"
+#include "server.h"
 
 #include <errno.h>
 #include <error.h>
@@ -46,10 +48,12 @@ usage (int status)
           "List the files that best match QUERY, best first.\n\n"
           "  -n, --count=N        show N matches (default 10)\n"
           "  -s, --scores         show the similarity score of each match\n"
-          "  -H, --host=URL       Ollama server (default %s)\n"
+          "  -H, --host=URL       use the Ollama server at URL instead of "
+          "starting\n"
+          "                       a private one on the GPU\n"
           "      --help           display this help and exit\n"
           "      --version        output version information and exit\n\n"
-          "Run embed-index first to build the store.\n", DEFAULT_HOST);
+          "Run embed-index first to build the store.\n");
   exit (status);
 }
 
@@ -87,7 +91,8 @@ insert_match (struct match *matches, size_t n, size_t *used,
 int
 main (int argc, char **argv)
 {
-  const char *host = DEFAULT_HOST;
+  const char *host = NULL;
+  struct server srv = { 0 };
   size_t count = 10, used = 0, dim, qdim;
   bool show_scores = false;
   char model[256];
@@ -146,10 +151,17 @@ main (int argc, char **argv)
       buf_puts (&query, argv[i]);
     }
 
+  if (!host)
+    {
+      server_start (&srv);
+      host = srv.url;
+    }
   embedder_init (&emb, host, model);
   if (!embed_text (&emb, query.data, 120, &qvec, &qdim))
     error (EXIT_FAILURE, 0, "cannot embed query with %s at %s", model,
            host);
+  embedder_free (&emb);
+  server_stop (&srv);
   if (qdim != dim)
     error (EXIT_FAILURE, 0, "query has dimension %zu but store has %zu",
            qdim, dim);
@@ -196,6 +208,5 @@ main (int argc, char **argv)
   free (qvec);
   free (line);
   buf_free (&query);
-  embedder_free (&emb);
   return EXIT_SUCCESS;
 }

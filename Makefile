@@ -11,13 +11,14 @@ PROGRAMS = embed-index embed-query
 
 all: $(PROGRAMS)
 
-embed-index: embed-index.o common.o
+embed-index: embed-index.o common.o server.o
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS_COMMON) -lmagic
 
-embed-query: embed-query.o common.o
+embed-query: embed-query.o common.o server.o
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS_COMMON)
 
-embed-index.o embed-query.o common.o: common.h
+embed-index.o embed-query.o common.o server.o: common.h
+embed-index.o embed-query.o server.o: server.h
 
 install: all
 	install -d $(DESTDIR)$(bindir)
