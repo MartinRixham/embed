@@ -206,6 +206,7 @@ embedder_init (struct embedder *e, const char *host, const char *model)
   buf_puts (&url, host);
   buf_puts (&url, "/api/embed");
   e->url = url.data;
+  e->host = xstrdup (host);
   e->model = xstrdup (model);
 }
 
@@ -215,6 +216,7 @@ embedder_free (struct embedder *e)
   curl_easy_cleanup (e->curl);
   curl_global_cleanup ();
   free (e->url);
+  free (e->host);
   free (e->model);
 }
 
@@ -311,6 +313,112 @@ embed_text (struct embedder *e, const char *text, long timeout,
 
  out:
   free (v);
+  buf_free (&req);
+  buf_free (&resp);
+  return ok;
+}
+
+/* POST the JSON object BODY to PATH on E's server, and store the
+   response in *RESP and its status in *STATUS.  Give up after TIMEOUT
+   seconds, or if TIMEOUT is 0, after a minute without data.  */
+static bool
+post_json (struct embedder *e, const char *path, const char *body,
+           long timeout, long *status, struct buf *resp)
+{
+  struct buf url;
+  struct curl_slist *headers = NULL;
+  CURLcode rc;
+
+  buf_init (&url);
+  buf_puts (&url, e->host);
+  buf_puts (&url, path);
+  headers = curl_slist_append (headers, "Content-Type: application/json");
+  curl_easy_reset (e->curl);
+  curl_easy_setopt (e->curl, CURLOPT_URL, url.data);
+  curl_easy_setopt (e->curl, CURLOPT_HTTPHEADER, headers);
+  curl_easy_setopt (e->curl, CURLOPT_POSTFIELDS, body);
+  curl_easy_setopt (e->curl, CURLOPT_WRITEFUNCTION, write_callback);
+  curl_easy_setopt (e->curl, CURLOPT_WRITEDATA, resp);
+  curl_easy_setopt (e->curl, CURLOPT_NOSIGNAL, 1L);
+  if (timeout)
+    curl_easy_setopt (e->curl, CURLOPT_TIMEOUT, timeout);
+  else
+    {
+      curl_easy_setopt (e->curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
+      curl_easy_setopt (e->curl, CURLOPT_LOW_SPEED_TIME, 60L);
+    }
+  rc = curl_easy_perform (e->curl);
+  curl_slist_free_all (headers);
+  buf_free (&url);
+  if (rc != CURLE_OK)
+    {
+      error (0, 0, "request to %s%s failed: %s", e->host, path,
+             curl_easy_strerror (rc));
+      return false;
+    }
+  curl_easy_getinfo (e->curl, CURLINFO_RESPONSE_CODE, status);
+  return true;
+}
+
+/* Return the last line of the streamed response TEXT that is not
+   empty.  */
+static const char *
+last_line (const char *text)
+{
+  const char *end = text + strlen (text);
+  const char *start;
+
+  while (end > text && (end[-1] == '\n' || end[-1] == '\r'))
+    end--;
+  for (start = end; start > text && start[-1] != '\n'; start--)
+    continue;
+  return start;
+}
+
+bool
+ensure_model (struct embedder *e)
+{
+  struct buf req, resp;
+  long status = 0;
+  bool ok = false;
+  const char *last;
+
+  buf_init (&req);
+  buf_init (&resp);
+  buf_puts (&req, "{\"model\":");
+  buf_json_string (&req, e->model);
+  buf_puts (&req, "}");
+  if (!post_json (e, "/api/show", req.data, 30, &status, &resp))
+    goto out;
+  if (status == 200)
+    {
+      ok = true;
+      goto out;
+    }
+  if (status != 404)
+    {
+      error (0, 0, "cannot look up model %s: server returned %ld: %.200s",
+             e->model, status, resp.data);
+      goto out;
+    }
+
+  error (0, 0, "downloading model %s; this is needed only once",
+         e->model);
+  resp.len = 0;
+  resp.data[0] = '\0';
+  /* Ollama streams progress, which keeps the connection alive however
+     long the download takes, and ends with "success" or an error.  */
+  if (!post_json (e, "/api/pull", req.data, 0, &status, &resp))
+    goto out;
+  last = last_line (resp.data);
+  if (status == 200 && strstr (last, "\"status\":\"success\"")
+      && !strstr (last, "\"error\""))
+    ok = true;
+  else
+    error (0, 0, "cannot download model %s: server returned %ld: %.200s",
+           e->model, status, last);
+
+ out:
   buf_free (&req);
   buf_free (&resp);
   return ok;

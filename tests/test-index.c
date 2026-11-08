@@ -1183,21 +1183,70 @@ START_TEST (test_index_model_change)
 {
   put ("a.txt", "alpha");
   ck_assert_int_eq (run_index (NULL), 0);
-  ck_assert_int_eq (run_index ("-m", "other-model", NULL), 0);
+  /* A store left by an older version that used another model.  */
+  char *store = read_file (fx.store);
+  char *rest = strchr (store, '\n');
+  char *old;
+  ck_assert_int_ge (asprintf (&old, "# embed-index model=other-model "
+                              "dim=8%s", rest), 0);
+  write_file (fx.store, old, (size_t) -1);
+
+  ck_assert_int_eq (run_index (NULL), 0);
   ck_assert_ptr_nonnull (strstr (err_text (), "model changed from "
-                                 "nomic-embed-text to other-model"));
+                                 "other-model to " EMBED_MODEL));
   ck_assert (starts_with (read_file (fx.store),
-                          "# embed-index model=other-model dim=8\n"));
+                          "# embed-index model=" EMBED_MODEL " dim=8\n"));
   ck_assert_uint_eq (record_count (), 1);
   ck_assert_ptr_nonnull (strstr (err_text (), "embedded 1, unchanged 0"));
-
-  /* The store's model is kept when none is given, or the same one.  */
   ck_assert_int_eq (run_index (NULL), 0);
   ck_assert_ptr_nonnull (strstr (err_text (), "unchanged 1"));
-  ck_assert_int_eq (run_index ("-m", "other-model", NULL), 0);
-  ck_assert_ptr_nonnull (strstr (err_text (), "unchanged 1"));
-  ck_assert_uint_eq (count_substr (read_file (fx.log),
-                                   "\"model\":\"other-model\""), 4);
+  ck_assert_ptr_null (strstr (read_file (fx.log), "other-model"));
+}
+END_TEST
+
+START_TEST (test_index_model_option_removed)
+{
+  ck_assert_int_eq (run_index ("-m", "other-model", NULL), EXIT_FAILURE);
+  ck_assert_ptr_null (read_file (fx.store));
+}
+END_TEST
+
+/* Restart the fake server with its model in STATE.  */
+static void
+restart_fake (const char *state)
+{
+  fake_stop (&fx.fake);
+  setenv ("FAKE_MODEL", state, 1);
+  fake_start (&fx.fake, fx.log);
+  unsetenv ("FAKE_MODEL");
+}
+
+START_TEST (test_index_pulls_missing_model)
+{
+  restart_fake ("missing");
+  put ("a.txt", "alpha");
+  ck_assert_int_eq (run_index (NULL), 0);
+  ck_assert_ptr_nonnull (strstr (err_text (), "downloading model "
+                                 EMBED_MODEL));
+  ck_assert_uint_eq (record_count (), 1);
+  /* The second run finds it in place.  */
+  put ("b.txt", "omega");
+  ck_assert_int_eq (run_index (NULL), 0);
+  ck_assert_ptr_null (strstr (err_text (), "downloading"));
+  ck_assert_uint_eq (record_count (), 2);
+}
+END_TEST
+
+START_TEST (test_index_pull_fails)
+{
+  restart_fake ("pullfail");
+  put ("a.txt", "alpha");
+  ck_assert_int_eq (run_index (NULL), EXIT_FAILURE);
+  ck_assert_ptr_nonnull (strstr (err_text (), "cannot download model"));
+  ck_assert_ptr_nonnull (strstr (err_text (), "model " EMBED_MODEL
+                                 " is unavailable"));
+  ck_assert_ptr_null (read_file (fx.store));
+  ck_assert_uint_eq (requests (), 0);
 }
 END_TEST
 
@@ -1360,7 +1409,7 @@ START_TEST (test_index_server_down)
   put ("a.txt", "alpha");
   ck_assert_int_eq (run_main (index_main, argv, fx.out, fx.err),
                     EXIT_FAILURE);
-  ck_assert_ptr_nonnull (strstr (err_text (), "cannot load model"));
+  ck_assert_ptr_nonnull (strstr (err_text (), "is unavailable"));
   ck_assert_ptr_null (read_file (fx.store));
 }
 END_TEST
@@ -1413,6 +1462,8 @@ START_TEST (test_index_options)
 
   ck_assert_int_eq (run_main (index_main, help, fx.out, fx.err), 0);
   ck_assert (starts_with (read_file (fx.out), "Usage: embed-index"));
+  ck_assert_ptr_nonnull (strstr (read_file (fx.out), "model " EMBED_MODEL));
+  ck_assert_ptr_null (strstr (read_file (fx.out), "--model"));
   ck_assert_int_eq (run_main (index_main, version, fx.out, fx.err), 0);
   ck_assert_str_eq (read_file (fx.out), "embed-index " PACKAGE_VERSION "\n");
   ck_assert_int_eq (run_main (index_main, bad, fx.out, fx.err),
@@ -1541,6 +1592,9 @@ index_suite (void)
   tcase_add_test (tc, test_index_long_file_is_cut);
   tcase_add_test (tc, test_index_binary_content_is_safe);
   tcase_add_test (tc, test_index_model_change);
+  tcase_add_test (tc, test_index_model_option_removed);
+  tcase_add_test (tc, test_index_pulls_missing_model);
+  tcase_add_test (tc, test_index_pull_fails);
   tcase_add_test (tc, test_index_recovers_from_crash);
   tcase_add_test (tc, test_index_header_without_newline);
   tcase_add_test (tc, test_index_wrong_dimension_reported);

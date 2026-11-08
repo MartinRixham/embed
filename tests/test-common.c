@@ -443,6 +443,7 @@ START_TEST (test_embedder_init_url)
 
   embedder_init (&e, "http://example:1", "m");
   ck_assert_str_eq (e.url, "http://example:1/api/embed");
+  ck_assert_str_eq (e.host, "http://example:1");
   ck_assert_str_eq (e.model, "m");
   embedder_free (&e);
 }
@@ -594,6 +595,116 @@ check_embed_fails (const char *text, const char *expect)
   free (err);
   fixture_free (&fx);
 }
+
+/* Run ensure_model against a fake server whose model is in STATE (see
+   fake-http.h), or NULL for a plain dead URL.  Return its result, and
+   store what it wrote on standard error in *ERR.  After a successful
+   call, check that embedding works.  */
+static bool
+run_ensure_model (const char *state, char **err)
+{
+  struct fixture fx;
+  char *err_path;
+  bool ok;
+
+  if (state)
+    setenv ("FAKE_MODEL", state, 1);
+  else
+    unsetenv ("FAKE_MODEL");
+  fixture_init (&fx, "m");
+  unsetenv ("FAKE_MODEL");
+  if (!state)
+    {
+      free (fx.emb.host);
+      fx.emb.host = xstrdup (dead_url ());
+    }
+  err_path = path_join (fx.dir, "stderr");
+  ck_assert_ptr_nonnull (freopen (err_path, "w", stderr));
+  ok = ensure_model (&fx.emb);
+  fflush (stderr);
+  *err = read_file (err_path);
+  if (ok)
+    {
+      float *v;
+      size_t dim;
+
+      ck_assert (embed_text (&fx.emb, "sourdough", 5, &v, &dim));
+      free (v);
+      /* Pulled once and for all.  */
+      ck_assert (ensure_model (&fx.emb));
+    }
+  fixture_free (&fx);
+  return ok;
+}
+
+START_TEST (test_ensure_model_present)
+{
+  char *err;
+
+  ck_assert (run_ensure_model ("", &err));
+  ck_assert_str_eq (err, "");
+}
+END_TEST
+
+START_TEST (test_ensure_model_pulls_missing)
+{
+  char *err;
+
+  ck_assert (run_ensure_model ("missing", &err));
+  ck_assert_msg (strstr (err, "downloading model m"), "stderr: %s", err);
+  ck_assert_uint_eq (count_substr (err, "downloading"), 1);
+}
+END_TEST
+
+START_TEST (test_ensure_model_pull_error)
+{
+  char *err;
+
+  ck_assert (!run_ensure_model ("pullfail", &err));
+  ck_assert_msg (strstr (err, "cannot download model m"), "stderr: %s",
+                 err);
+  ck_assert_ptr_nonnull (strstr (err, "file does not exist"));
+}
+END_TEST
+
+START_TEST (test_ensure_model_pull_http_error)
+{
+  char *err;
+
+  ck_assert (!run_ensure_model ("pull500", &err));
+  ck_assert_msg (strstr (err, "returned 500"), "stderr: %s", err);
+  ck_assert_ptr_nonnull (strstr (err, "registry unreachable"));
+}
+END_TEST
+
+START_TEST (test_ensure_model_show_error)
+{
+  char *err;
+
+  ck_assert (!run_ensure_model ("showfail", &err));
+  ck_assert_msg (strstr (err, "cannot look up model m"), "stderr: %s", err);
+  ck_assert_ptr_null (strstr (err, "downloading"));
+}
+END_TEST
+
+START_TEST (test_ensure_model_server_down)
+{
+  char *err;
+
+  ck_assert (!run_ensure_model (NULL, &err));
+  ck_assert_msg (strstr (err, "/api/show failed"), "stderr: %s", err);
+}
+END_TEST
+
+START_TEST (test_last_line)
+{
+  ck_assert_str_eq (last_line (""), "");
+  ck_assert_str_eq (last_line ("one"), "one");
+  ck_assert_str_eq (last_line ("one\ntwo\n"), "two\n");
+  ck_assert_str_eq (last_line ("one\r\ntwo\r\n\n\n"), "two\r\n\n\n");
+  ck_assert_str_eq (last_line ("\n\n"), "\n\n");
+}
+END_TEST
 
 START_TEST (test_embed_http_error)
 {
@@ -772,6 +883,13 @@ common_suite (void)
   tcase_set_timeout (tc, 20);
   tcase_add_test (tc, test_embedder_init_url);
   tcase_add_test (tc, test_embed_success_normalized);
+  tcase_add_test (tc, test_ensure_model_present);
+  tcase_add_test (tc, test_ensure_model_pulls_missing);
+  tcase_add_test (tc, test_ensure_model_pull_error);
+  tcase_add_test (tc, test_ensure_model_pull_http_error);
+  tcase_add_test (tc, test_ensure_model_show_error);
+  tcase_add_test (tc, test_ensure_model_server_down);
+  tcase_add_test (tc, test_last_line);
   tcase_add_test (tc, test_embed_request_body);
   tcase_add_test (tc, test_embed_reuses_connection_handle);
   tcase_add_test (tc, test_embed_large_input);

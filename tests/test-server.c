@@ -13,11 +13,18 @@
    becomes ready.  */
 #define START_TIMEOUT 2
 
+/* Stand in for the system service's model store, so that the tests do
+   not depend on what is installed.  */
+static const char *test_system_models = "/nonexistent/embed-test/models";
+#define SYSTEM_MODELS test_system_models
+
 #include "../server.c"
 
 #include "testutil.h"
 
 #include <check.h>
+#include <stdarg.h>
+#include <stdio.h>
 
 /* A temporary home directory, with the fake ollama first on PATH.  */
 struct fixture
@@ -178,21 +185,112 @@ START_TEST (test_cpu_environment)
 }
 END_TEST
 
-START_TEST (test_models_directory)
+/* Create a model store under the fixture's home holding a manifest for
+   each of the NULL-terminated MODELS, and return its directory.  */
+static char *
+make_models (struct fixture *fx, const char *model, ...)
+{
+  char *dir = path_join (fx->home, "system-models");
+  va_list ap;
+
+  mkdir (dir, 0755);
+  va_start (ap, model);
+  for (const char *m = model; m; m = va_arg (ap, const char *))
+    {
+      char *rel, *path;
+
+      ck_assert_int_ge (asprintf (&rel, "manifests/registry.ollama.ai/%s",
+                                  m), 0);
+      path = path_join (dir, rel);
+      write_file (path, "{}", (size_t) -1);
+      free (rel);
+      free (path);
+    }
+  va_end (ap);
+  return dir;
+}
+
+START_TEST (test_has_model)
 {
   struct fixture fx;
-  struct server s;
-  struct stat st;
-  char *models;
+  char *dir;
 
   fixture_init (&fx);
+  dir = make_models (&fx, "library/nomic-embed-text/latest",
+                     "library/qwen3-embedding/0.6b", "someone/thing/latest",
+                     NULL);
+  ck_assert (has_model (dir, "nomic-embed-text"));
+  ck_assert (has_model (dir, "nomic-embed-text:latest"));
+  ck_assert (has_model (dir, "qwen3-embedding:0.6b"));
+  ck_assert (has_model (dir, "someone/thing"));
+  ck_assert (!has_model (dir, "qwen3-embedding"));
+  ck_assert (!has_model (dir, "qwen3-embedding:4b"));
+  ck_assert (!has_model (dir, "nomic"));
+  ck_assert (!has_model (dir, "thing"));
+  ck_assert (!has_model ("/nonexistent", "nomic-embed-text"));
+  fixture_free (&fx);
+}
+END_TEST
+
+/* Start a server and return its OLLAMA_MODELS and its log.  */
+static char *
+models_used (struct fixture *fx, char **log)
+{
+  struct server s;
+  char *models, *log_file;
+
   server_start (&s, false);
-  models = server_env (&fx, "OLLAMA_MODELS");
-  if (stat (SYSTEM_MODELS, &st) == 0)
-    ck_assert_str_eq (models, SYSTEM_MODELS);
-  else
-    ck_assert_ptr_null (models);
+  models = server_env (fx, "OLLAMA_MODELS");
   server_stop (&s);
+  log_file = path_join (fx->home, ".local/state/embed/ollama.log");
+  *log = read_file (log_file);
+  ck_assert_ptr_nonnull (*log);
+  free (log_file);
+  return models;
+}
+
+START_TEST (test_models_system_store)
+{
+  struct fixture fx;
+  char *log;
+
+  fixture_init (&fx);
+  test_system_models = make_models (&fx, "library/" EMBED_MODEL "/latest",
+                                    NULL);
+  ck_assert_str_eq (models_used (&fx, &log), test_system_models);
+  ck_assert_ptr_nonnull (strstr (log, "embed: using " EMBED_MODEL " in "));
+  fixture_free (&fx);
+}
+END_TEST
+
+/* The system store cannot be written, so a model missing from it is
+   pulled into one of our own.  */
+START_TEST (test_models_own_store_when_model_missing)
+{
+  struct fixture fx;
+  struct stat st;
+  char *own, *log;
+
+  fixture_init (&fx);
+  test_system_models = make_models (&fx, "library/other/latest", NULL);
+  own = path_join (fx.home, ".local/share/embed/models");
+  ck_assert_str_eq (models_used (&fx, &log), own);
+  ck_assert_int_eq (stat (own, &st), 0);
+  ck_assert (S_ISDIR (st.st_mode));
+  ck_assert_ptr_nonnull (strstr (log, "is not in "));
+  fixture_free (&fx);
+}
+END_TEST
+
+/* As in a container, which does not see the host's /var/lib.  */
+START_TEST (test_models_own_store_without_system_store)
+{
+  struct fixture fx;
+  char *log;
+
+  fixture_init (&fx);
+  ck_assert_str_eq (models_used (&fx, &log),
+                    path_join (fx.home, ".local/share/embed/models"));
   fixture_free (&fx);
 }
 END_TEST
@@ -200,13 +298,31 @@ END_TEST
 START_TEST (test_models_directory_override)
 {
   struct fixture fx;
-  struct server s;
+  char *log;
 
   fixture_init (&fx);
+  test_system_models = make_models (&fx, "library/" EMBED_MODEL "/latest",
+                                    NULL);
   setenv ("OLLAMA_MODELS", "/somewhere/else", 1);
-  server_start (&s, true);
-  ck_assert_str_eq (server_env (&fx, "OLLAMA_MODELS"), "/somewhere/else");
-  server_stop (&s);
+  ck_assert_str_eq (models_used (&fx, &log), "/somewhere/else");
+  ck_assert_ptr_nonnull (strstr (log, "OLLAMA_MODELS=/somewhere/else from "
+                                 "the environment"));
+  fixture_free (&fx);
+}
+END_TEST
+
+/* An empty OLLAMA_MODELS is the same as an unset one; ollama would
+   otherwise fall back to an empty store in ~/.ollama.  */
+START_TEST (test_models_directory_empty)
+{
+  struct fixture fx;
+  char *log;
+
+  fixture_init (&fx);
+  test_system_models = make_models (&fx, "library/" EMBED_MODEL "/latest",
+                                    NULL);
+  setenv ("OLLAMA_MODELS", "", 1);
+  ck_assert_str_eq (models_used (&fx, &log), test_system_models);
   fixture_free (&fx);
 }
 END_TEST
@@ -438,8 +554,12 @@ server_suite (void)
   tcase_add_test (tc, test_server_host_matches_url);
   tcase_add_test (tc, test_gpu_environment);
   tcase_add_test (tc, test_cpu_environment);
-  tcase_add_test (tc, test_models_directory);
+  tcase_add_test (tc, test_has_model);
+  tcase_add_test (tc, test_models_system_store);
+  tcase_add_test (tc, test_models_own_store_when_model_missing);
+  tcase_add_test (tc, test_models_own_store_without_system_store);
   tcase_add_test (tc, test_models_directory_override);
+  tcase_add_test (tc, test_models_directory_empty);
   tcase_add_test (tc, test_log_written);
   tcase_add_test (tc, test_own_process_group);
   tcase_add_test (tc, test_stop_kills_runners);

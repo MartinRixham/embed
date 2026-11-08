@@ -227,6 +227,9 @@ main (int argc, char **argv)
   len = getline (&line, &line_size, f);
   if (len <= 0 || !parse_header (line, model, sizeof model, &dim))
     error (EXIT_FAILURE, 0, "%s: missing or invalid header", store);
+  if (strcmp (model, EMBED_MODEL) != 0)
+    error (EXIT_FAILURE, 0, "%s was built with %s; run embed-index to "
+           "rebuild it with %s", store, model, EMBED_MODEL);
 
   buf_init (&query);
   buf_puts (&query, query_prefix (model));
@@ -245,6 +248,8 @@ main (int argc, char **argv)
       host = srv.url;
     }
   embedder_init (&emb, host, model);
+  if (!ensure_model (&emb))
+    error (EXIT_FAILURE, 0, "model %s is unavailable at %s", model, host);
   if (!embed_text (&emb, query.data, 120, &qvec, &qdim))
     error (EXIT_FAILURE, 0, "cannot embed query with %s at %s", model,
            host);

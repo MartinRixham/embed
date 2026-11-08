@@ -265,7 +265,7 @@ START_TEST (test_query_default_count)
   char line[256];
 
   buf_init (&b);
-  snprintf (line, sizeof line, "# embed-index model=m dim=%d\n", FAKE_DIM);
+  snprintf (line, sizeof line, "# embed-index model=" EMBED_MODEL " dim=%d\n", FAKE_DIM);
   buf_puts (&b, line);
   for (int i = 0; i < 25; i++)
     {
@@ -293,15 +293,41 @@ START_TEST (test_query_joins_words_and_prefixes)
 }
 END_TEST
 
-START_TEST (test_query_uses_store_model)
+START_TEST (test_query_rejects_other_model)
 {
-  char *log;
-
   make_store ("qwen3-embedding:0.6b", "/h/a", 0, NULL);
-  ck_assert_int_eq (run_query ("x", NULL), 0);
-  log = read_file (fx.log);
-  ck_assert_ptr_nonnull (strstr (log, "\"model\":\"qwen3-embedding:0.6b\""));
-  ck_assert_ptr_nonnull (strstr (log, "Instruct: "));
+  ck_assert_int_eq (run_query ("x", NULL), EXIT_FAILURE);
+  ck_assert_ptr_nonnull (strstr (err_text (), "built with "
+                                 "qwen3-embedding:0.6b; run embed-index"));
+  /* Without asking the server.  */
+  ck_assert_ptr_null (read_file (fx.log));
+}
+END_TEST
+
+START_TEST (test_query_pulls_missing_model)
+{
+  fake_stop (&fx.fake);
+  setenv ("FAKE_MODEL", "missing", 1);
+  fake_start (&fx.fake, fx.log);
+  unsetenv ("FAKE_MODEL");
+  make_store (EMBED_MODEL, "/h/bread.txt", 0, NULL);
+  ck_assert_int_eq (run_query ("sourdough", NULL), 0);
+  ck_assert_ptr_nonnull (strstr (err_text (), "downloading model "
+                                 EMBED_MODEL));
+  ck_assert_str_eq (out_text (), "/h/bread.txt\n");
+}
+END_TEST
+
+START_TEST (test_query_pull_fails)
+{
+  fake_stop (&fx.fake);
+  setenv ("FAKE_MODEL", "pull500", 1);
+  fake_start (&fx.fake, fx.log);
+  unsetenv ("FAKE_MODEL");
+  make_store (EMBED_MODEL, "/h/bread.txt", 0, NULL);
+  ck_assert_int_eq (run_query ("sourdough", NULL), EXIT_FAILURE);
+  ck_assert_ptr_nonnull (strstr (err_text (), "is unavailable"));
+  ck_assert_str_eq (out_text (), "");
 }
 END_TEST
 
@@ -310,7 +336,7 @@ START_TEST (test_query_skips_bad_lines)
   char data[2048];
 
   snprintf (data, sizeof data,
-            "# embed-index model=m dim=%d\n"
+            "# embed-index model=" EMBED_MODEL " dim=%d\n"
             "no tabs at all\n"
             "1 1\tonly one tab\n"
             "1 1\t/short\t1 0 0\n"
@@ -327,7 +353,7 @@ END_TEST
 START_TEST (test_query_newest_record_wins)
 {
   /* /a was re-embedded but the store was not yet compacted.  */
-  make_store ("m", "/a", 0, "/b", 2, "/a", 1, NULL);
+  make_store (EMBED_MODEL, "/a", 0, "/b", 2, "/a", 1, NULL);
   ck_assert_int_eq (run_query ("-s", "sourdough", NULL), 0);
   ck_assert_uint_eq (count_substr (out_text (), "/a\n"), 1);
   ck_assert_int_eq (run_query ("-n", "1", "invoice", NULL), 0);
@@ -339,7 +365,7 @@ START_TEST (test_query_stale_record_does_not_hide_match)
 {
   /* /a scored best, but its newer record scores badly: /c, rejected
      while /a and /b filled the two places, must still be found.  */
-  make_store ("m", "/a", 0, "/b", 0, "/c", -1, "/a", 2, NULL);
+  make_store (EMBED_MODEL, "/a", 0, "/b", 0, "/c", -1, "/a", 2, NULL);
   ck_assert_int_eq (run_query ("-n", "2", "sourdough", NULL), 0);
   ck_assert_str_eq (out_text (), "/b\n/c\n");
 }
@@ -347,7 +373,7 @@ END_TEST
 
 START_TEST (test_query_paths_with_spaces)
 {
-  make_store ("m", "/h/My Documents/tax return 2025.pdf", 1, NULL);
+  make_store (EMBED_MODEL, "/h/My Documents/tax return 2025.pdf", 1, NULL);
   ck_assert_int_eq (run_query ("invoice", NULL), 0);
   ck_assert_str_eq (out_text (), "/h/My Documents/tax return 2025.pdf\n");
 }
@@ -355,7 +381,7 @@ END_TEST
 
 START_TEST (test_query_empty_store)
 {
-  make_store ("m", NULL);
+  make_store (EMBED_MODEL, NULL);
   ck_assert_int_eq (run_query ("anything", NULL), 0);
   ck_assert_str_eq (out_text (), "");
 }
@@ -380,7 +406,7 @@ END_TEST
 
 START_TEST (test_query_dimension_mismatch)
 {
-  write_file (fx.store, "# embed-index model=m dim=3\n1 1\t/a\t1 0 0\n",
+  write_file (fx.store, "# embed-index model=" EMBED_MODEL " dim=3\n1 1\t/a\t1 0 0\n",
               (size_t) -1);
   ck_assert_int_eq (run_query ("x", NULL), EXIT_FAILURE);
   ck_assert_ptr_nonnull (strstr (err_text (), "dimension 8 but store has "
@@ -392,16 +418,16 @@ START_TEST (test_query_server_down)
 {
   char *argv[] = { "embed-query", "-H", (char *) dead_url (), "x", NULL };
 
-  make_store ("m", "/a", 0, NULL);
+  make_store (EMBED_MODEL, "/a", 0, NULL);
   ck_assert_int_eq (run_main (query_main, argv, fx.out, fx.err),
                     EXIT_FAILURE);
-  ck_assert_ptr_nonnull (strstr (err_text (), "cannot embed query"));
+  ck_assert_ptr_nonnull (strstr (err_text (), "is unavailable"));
 }
 END_TEST
 
 START_TEST (test_query_server_error)
 {
-  make_store ("m", "/a", 0, NULL);
+  make_store (EMBED_MODEL, "/a", 0, NULL);
   ck_assert_int_eq (run_query ("FAKE_500", NULL), EXIT_FAILURE);
   ck_assert_ptr_nonnull (strstr (err_text (), "cannot embed query"));
 }
@@ -409,7 +435,7 @@ END_TEST
 
 START_TEST (test_query_missing_query)
 {
-  make_store ("m", "/a", 0, NULL);
+  make_store (EMBED_MODEL, "/a", 0, NULL);
   ck_assert_int_eq (run_query (NULL), EXIT_FAILURE);
   ck_assert_ptr_nonnull (strstr (err_text (), "missing query"));
 }
@@ -421,7 +447,7 @@ START_TEST (test_query_bad_count)
     "0", "-1", "abc", "5x", "", "1000001", "99999999999999999999", NULL
   };
 
-  make_store ("m", "/a", 0, NULL);
+  make_store (EMBED_MODEL, "/a", 0, NULL);
   for (int i = 0; bad[i]; i++)
     ck_assert_msg (run_query ("-n", bad[i], "x", NULL) == EXIT_FAILURE,
                    "count '%s' accepted", bad[i]);
@@ -453,7 +479,7 @@ START_TEST (test_query_private_cpu_server)
   install_fake_ollama (fx.root);
   setenv ("FAKE_OLLAMA_ENV", env_file, 1);
   setenv ("FAKE_OLLAMA_RUNNER", runner_file, 1);
-  make_store ("m", "/h/bread.txt", 0, NULL);
+  make_store (EMBED_MODEL, "/h/bread.txt", 0, NULL);
   ck_assert_int_eq (run_main (query_main, argv, fx.out, fx.err), 0);
   ck_assert_str_eq (out_text (), "/h/bread.txt\n");
 
@@ -511,7 +537,9 @@ query_suite (void)
   tcase_add_test (tc, test_query_scores);
   tcase_add_test (tc, test_query_default_count);
   tcase_add_test (tc, test_query_joins_words_and_prefixes);
-  tcase_add_test (tc, test_query_uses_store_model);
+  tcase_add_test (tc, test_query_rejects_other_model);
+  tcase_add_test (tc, test_query_pulls_missing_model);
+  tcase_add_test (tc, test_query_pull_fails);
   tcase_add_test (tc, test_query_skips_bad_lines);
   tcase_add_test (tc, test_query_newest_record_wins);
   tcase_add_test (tc, test_query_stale_record_does_not_hide_match);

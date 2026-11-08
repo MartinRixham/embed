@@ -34,7 +34,17 @@ extern const char *const fake_keywords[FAKE_DIM];
      FAKE_DIM3       a 3-dimensional vector
      FAKE_ZERO       a vector of zeros
      FAKE_SPACES     the normal answer, laid out with white space
-     FAKE_SLOW       the normal answer, after a 3 second delay  */
+     FAKE_SLOW       the normal answer, after a 3 second delay
+
+   /api/show and /api/pull answer as for an available model, unless
+   the environment variable FAKE_MODEL is
+
+     missing    the model is missing until pulled; pulling succeeds
+     pullfail   the model is missing, and pulling ends with an error
+     pull500    the model is missing, and pulling answers HTTP 500
+     showfail   /api/show answers HTTP 500
+
+   While the model is missing, /api/embed answers 404.  */
 void fake_serve (int listen_fd, const char *log) __attribute__ ((noreturn));
 
 /* Bind a listening socket to a free loopback port.  Store the port in

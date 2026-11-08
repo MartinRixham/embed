@@ -68,7 +68,6 @@ static long embed_timeout = 4;
 static struct option const long_options[] = {
   {"all", no_argument, NULL, 'a'},
   {"host", required_argument, NULL, 'H'},
-  {"model", required_argument, NULL, 'm'},
   {"timeout", required_argument, NULL, 't'},
   {"verbose", no_argument, NULL, 'v'},
   {"help", no_argument, NULL, 'h'},
@@ -85,22 +84,19 @@ usage (int status)
       exit (status);
     }
   printf ("Usage: embed-index [OPTION]... [DIRECTORY]...\n"
-          "Embed every file under each DIRECTORY (default: $HOME) with a "
-          "local model.\n\n"
+          "Embed every file under each DIRECTORY (default: $HOME) with "
+          "the local\nmodel %s, which is downloaded if it is missing.\n\n"
           "  -a, --all            include hidden files and directories\n"
           "  -H, --host=URL       use the Ollama server at URL instead of "
           "starting\n"
           "                       a private one on the GPU\n"
-          "  -m, --model=NAME     embedding model (default: the model of "
-          "the\n"
-          "                       existing store, or %s)\n"
           "  -t, --timeout=SECS   time limit for each embedding (default "
           "%ld)\n"
           "  -v, --verbose        print each file as it is embedded\n"
           "      --help           display this help and exit\n"
           "      --version        output version information and exit\n\n"
           "Embeddings are stored in ~/.local/share/embed/embeddings.txt.\n",
-          DEFAULT_MODEL, embed_timeout);
+          EMBED_MODEL, embed_timeout);
   exit (status);
 }
 
@@ -544,7 +540,6 @@ main (int argc, char **argv)
 {
   const char *host = NULL;
   struct server srv = { 0 };
-  const char *model_opt = NULL;
   char store_model[256];
   char *store = store_path ();
   char *store_dir;
@@ -561,7 +556,7 @@ main (int argc, char **argv)
   bool have_store;
   int c;
 
-  while ((c = getopt_long (argc, argv, "aH:m:t:v", long_options, NULL))
+  while ((c = getopt_long (argc, argv, "aH:t:v", long_options, NULL))
          != -1)
     switch (c)
       {
@@ -570,9 +565,6 @@ main (int argc, char **argv)
         break;
       case 'H':
         host = optarg;
-        break;
-      case 'm':
-        model_opt = optarg;
         break;
       case 't':
         if (!parse_positive (optarg, 3600, &embed_timeout))
@@ -609,32 +601,31 @@ main (int argc, char **argv)
   *strrchr (store_dir, '/') = '\0';
 
   have_store = load_store (store, store_model, sizeof store_model);
-  if (have_store && model_opt && strcmp (model_opt, store_model) != 0)
+  if (have_store && strcmp (store_model, EMBED_MODEL) != 0)
     {
       error (0, 0, "model changed from %s to %s; reindexing everything",
-             store_model, model_opt);
+             store_model, EMBED_MODEL);
       have_store = false;
       for (size_t i = 0; i < n_entries; i++)
         free (entries[i].path);
       n_entries = 0;
       n_lines = 0;
     }
-  if (!have_store)
-    snprintf (store_model, sizeof store_model, "%s",
-              model_opt ? model_opt : DEFAULT_MODEL);
 
   if (!host)
     {
       server_start (&srv, true);
       host = srv.url;
     }
-  embedder_init (&emb, host, store_model);
+  embedder_init (&emb, host, EMBED_MODEL);
+  if (!ensure_model (&emb))
+    error (EXIT_FAILURE, 0, "model %s is unavailable at %s", EMBED_MODEL,
+           host);
 
   /* Warm up the model, which may take a while to load, and learn its
      dimension.  */
   if (!embed_text (&emb, "warm up", 120, &vec, &dim))
-    error (EXIT_FAILURE, 0, "cannot load model %s at %s; has it been "
-           "pulled with 'ollama pull %s'?", store_model, host, store_model);
+    error (EXIT_FAILURE, 0, "cannot load model %s at %s", EMBED_MODEL, host);
   free (vec);
 
   if (have_store)
@@ -650,7 +641,7 @@ main (int argc, char **argv)
       out = fopen (store, "w");
       if (out)
         {
-          fprintf (out, "# embed-index model=%s dim=%zu\n", store_model,
+          fprintf (out, "# embed-index model=%s dim=%zu\n", EMBED_MODEL,
                    dim);
           keep_push (1);
         }
@@ -711,14 +702,14 @@ main (int argc, char **argv)
 
       buf_init (&text);
       describe_file (magic_mime, magic_desc, ent->fts_path, home,
-                     store_model, true, &text);
+                     EMBED_MODEL, true, &text);
       bool ok = embed_checked (&emb, text.data, embed_timeout, dim, &vec);
       if (!ok && !interrupted)
         {
           /* Fall back to embedding just the name and type.  */
           text.len = 0;
           describe_file (magic_mime, magic_desc, ent->fts_path, home,
-                         store_model, false, &text);
+                         EMBED_MODEL, false, &text);
           ok = embed_checked (&emb, text.data, FALLBACK_TIMEOUT, dim, &vec);
         }
       buf_free (&text);

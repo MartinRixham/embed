@@ -33,7 +33,13 @@
 #include <unistd.h>
 
 /* Where Fedora's ollama package keeps the models it pulls.  */
-#define SYSTEM_MODELS "/var/lib/ollama/.ollama/models"
+#ifndef SYSTEM_MODELS
+# define SYSTEM_MODELS "/var/lib/ollama/.ollama/models"
+#endif
+
+/* Where to keep models that are not in the system store, under the
+   home directory.  */
+#define OWN_MODELS ".local/share/embed/models"
 
 /* How long to wait for the server to accept requests, in seconds.  */
 #ifndef START_TIMEOUT
@@ -73,10 +79,58 @@ log_path (void)
 
 /* Set up the environment of the server process and run it.  Only
    called in the child.  */
+/* Return true if the Ollama model store DIR holds MODEL.  */
+static bool
+has_model (const char *dir, const char *model)
+{
+  const char *colon = strchr (model, ':');
+  int name_len = colon ? (int) (colon - model) : (int) strlen (model);
+  const char *tag = colon ? colon + 1 : "latest";
+  char path[4096];
+  int n;
+
+  /* Names without a namespace are in the "library" one.  */
+  n = snprintf (path, sizeof path, "%s/manifests/registry.ollama.ai/%s%.*s/%s",
+                dir, memchr (model, '/', name_len) ? "" : "library/",
+                name_len, model, tag);
+  return n > 0 && (size_t) n < sizeof path && access (path, R_OK) == 0;
+}
+
+/* Point OLLAMA_MODELS at the store to use, in the child, and log why.
+   The system service's store is shared when it has the model, but it
+   is not writable, so a missing model is pulled into a store of our
+   own instead.  */
+static void
+choose_models (void)
+{
+  const char *models = getenv ("OLLAMA_MODELS");
+  const char *home = getenv ("HOME");
+  char own[4096];
+
+  if (models && *models)
+    {
+      dprintf (STDERR_FILENO, "embed: using OLLAMA_MODELS=%s from the"
+               " environment\n", models);
+      return;
+    }
+  if (has_model (SYSTEM_MODELS, EMBED_MODEL))
+    {
+      setenv ("OLLAMA_MODELS", SYSTEM_MODELS, 1);
+      dprintf (STDERR_FILENO, "embed: using %s in %s\n", EMBED_MODEL,
+               SYSTEM_MODELS);
+      return;
+    }
+  snprintf (own, sizeof own, "%s/" OWN_MODELS "/blobs", home ? home : ".");
+  make_parent_dirs (own);
+  *strrchr (own, '/') = '\0';
+  setenv ("OLLAMA_MODELS", own, 1);
+  dprintf (STDERR_FILENO, "embed: %s is not in %s; using %s\n",
+           EMBED_MODEL, SYSTEM_MODELS, own);
+}
+
 static void
 exec_server (const char *host, const char *log, pid_t parent, bool use_gpu)
 {
-  struct stat st;
   int fd;
 
   setpgid (0, 0);
@@ -111,10 +165,8 @@ exec_server (const char *host, const char *log, pid_t parent, bool use_gpu)
       setenv ("HIP_VISIBLE_DEVICES", "-1", 1);
       setenv ("ROCR_VISIBLE_DEVICES", "-1", 1);
     }
-  /* Share the models of the system service when there is one; never
-     delete anything from that store.  */
-  if (!getenv ("OLLAMA_MODELS") && stat (SYSTEM_MODELS, &st) == 0)
-    setenv ("OLLAMA_MODELS", SYSTEM_MODELS, 1);
+  /* Never delete anything from a store that may be shared.  */
+  choose_models ();
   setenv ("OLLAMA_NOPRUNE", "1", 1);
   setenv ("OLLAMA_MAX_LOADED_MODELS", "1", 1);
   setenv ("OLLAMA_NUM_PARALLEL", "1", 1);

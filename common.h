@@ -14,7 +14,11 @@
 #include <curl/curl.h>
 
 #define PACKAGE_VERSION "0.1"
-#define DEFAULT_MODEL "nomic-embed-text"
+/* The embedding model.  Both programs use it, and pull it into the
+   server's model store when it is missing.  */
+#ifndef EMBED_MODEL
+# define EMBED_MODEL "nomic-embed-text"
+#endif
 
 /* A growable byte buffer, always NUL terminated.  */
 struct buf
@@ -37,6 +41,7 @@ char *xstrdup (const char *s);
 struct embedder
 {
   CURL *curl;
+  char *host;
   char *url;
   char *model;
 };
@@ -52,6 +57,11 @@ void embedder_free (struct embedder *e);
    *DIM and return true.  */
 bool embed_text (struct embedder *e, const char *text, long timeout,
                  float **vec, size_t *dim);
+
+/* Make sure the server has the model, pulling it from the Ollama
+   registry if it does not.  Report problems on standard error and
+   return false if the model is still unavailable.  */
+bool ensure_model (struct embedder *e);
 
 /* Model-specific prefixes that tell the model whether it is looking at
    a document or a search query.  */

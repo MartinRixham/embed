@@ -83,6 +83,54 @@ count_ci (const char *hay, const char *needle)
   return n;
 }
 
+/* Whether the model has been pulled, for FAKE_MODEL=missing.  */
+static bool pulled;
+
+/* Return true if FAKE_MODEL is STATE.  */
+static bool
+model_state (const char *state)
+{
+  const char *s = getenv ("FAKE_MODEL");
+  return s && strcmp (s, state) == 0;
+}
+
+static bool
+model_missing (void)
+{
+  return !pulled && (model_state ("missing") || model_state ("pullfail")
+                     || model_state ("pull500"));
+}
+
+/* Answer an /api/show request.  */
+static void
+show_response (int fd)
+{
+  if (model_state ("showfail"))
+    respond (fd, 500, "{\"error\":\"show broke\"}");
+  else if (model_missing ())
+    respond (fd, 404, "{\"error\":\"model 'm' not found\"}");
+  else
+    respond (fd, 200, "{\"modelfile\":\"FROM m\"}");
+}
+
+/* Answer an /api/pull request, streaming progress like Ollama.  */
+static void
+pull_response (int fd)
+{
+  if (model_state ("pull500"))
+    return respond (fd, 500, "{\"error\":\"registry unreachable\"}");
+  if (model_state ("pullfail"))
+    return respond (fd, 200, "{\"status\":\"pulling manifest\"}\n"
+                    "{\"error\":\"pull model manifest: file does not "
+                    "exist\"}\n");
+  pulled = true;
+  respond (fd, 200, "{\"status\":\"pulling manifest\"}\n"
+           "{\"status\":\"pulling 970aa74c0a90\",\"total\":274290656,"
+           "\"completed\":274290656}\n"
+           "{\"status\":\"verifying sha256 digest\"}\n"
+           "{\"status\":\"success\"}\n");
+}
+
 /* Answer an /api/embed request whose body is BODY.  */
 static void
 embed_response (int fd, const char *body)
@@ -92,6 +140,9 @@ embed_response (int fd, const char *body)
   bool spaces = strstr (body, "FAKE_SPACES") != NULL;
   size_t len;
 
+  if (model_missing ())
+    return respond (fd, 404, "{\"error\":\"model \\\"m\\\" not found, "
+                    "try pulling it first\"}");
   if (strstr (body, "FAKE_500"))
     return respond (fd, 500, "{\"error\":\"boom\"}");
   if (strstr (body, "FAKE_TOOLONG"))
@@ -183,6 +234,10 @@ handle (int fd, const char *log)
         }
       embed_response (fd, body);
     }
+  else if (strncmp (req, "POST /api/show ", 15) == 0)
+    show_response (fd);
+  else if (strncmp (req, "POST /api/pull ", 15) == 0)
+    pull_response (fd);
   else if (strstr (req, " /api/version "))
     respond (fd, 200, "{\"version\":\"fake\"}");
   else
