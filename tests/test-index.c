@@ -619,6 +619,42 @@ START_TEST (test_extract_xlsx_strings)
 }
 END_TEST
 
+START_TEST (test_extract_epub)
+{
+  char *text, *meta, *ch1, *ch2;
+
+  if (!have_program ("zip") || !have_program ("unzip"))
+    return;
+  put ("e/mimetype", "application/epub+zip");
+  put ("e/META-INF/container.xml",
+       "<container><rootfiles><rootfile full-path=\"OPS/book.opf\" "
+       "media-type=\"application/oebps-package+xml\"/></rootfiles>"
+       "</container>");
+  put ("e/OPS/book.opf",
+       "<package><metadata><dc:title>The Quest</dc:title>"
+       "<dc:creator>A. Writer</dc:creator><dc:description>&lt;p&gt;A "
+       "wizard &amp; a hobbit&lt;/p&gt;</dc:description></metadata>"
+       "<manifest><item id=\"c2\" href=\"Text/two%20b.html\"/>"
+       "<item id=\"c1\" href=\"Text/one.html\"/></manifest>"
+       "<spine><itemref idref=\"c1\"/><itemref idref=\"c2\"/></spine>"
+       "</package>");
+  put ("e/OPS/Text/one.html", "<html><body><p>Chapter one&#8217;s "
+       "start</p></body></html>");
+  put ("e/OPS/Text/two b.html", "<html><body><p>Chapter two</p></body>"
+       "</html>");
+  shell ("cd e && zip -q -X -0 ../book.epub mimetype "
+         "&& zip -q -X -r ../book.epub META-INF OPS");
+  text = extract ("book.epub", "application/epub+zip");
+  meta = strstr (text, "The Quest A. Writer A wizard & a hobbit");
+  ch1 = strstr (text, "Chapter one’s start");
+  ch2 = strstr (text, "Chapter two");
+  ck_assert_ptr_nonnull (meta);
+  ck_assert_ptr_nonnull (ch1);
+  ck_assert_ptr_nonnull (ch2);
+  ck_assert (meta < ch1 && ch1 < ch2);
+}
+END_TEST
+
 /* Describing files.  */
 
 static magic_t mime_cookie, desc_cookie;
@@ -2025,6 +2061,7 @@ index_suite (void)
   tcase_add_test (tc, test_extract_audio_tags);
   tcase_add_test (tc, test_extract_video_streams);
   tcase_add_test (tc, test_extract_docx);
+  tcase_add_test (tc, test_extract_epub);
   tcase_add_test (tc, test_extract_odt);
   tcase_add_test (tc, test_extract_pptx_all_slides);
   tcase_add_test (tc, test_extract_xlsx_strings);

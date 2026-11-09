@@ -8,7 +8,7 @@
 
    A file is turned into a short text description (its name, location,
    type and, where possible, its content: plain text, PDF text, office
-   document text, OCR of images, or audio/video metadata and a
+   document text, EPUB book metadata and text, OCR of images, or audio/video metadata and a
    transcript of what is said) for the text model, and an image or
    video into a picture vector, from pixels that ffmpeg decodes.  */
 
@@ -158,6 +158,78 @@ strip_markup (struct buf *b)
   b->data[out] = '\0';
 }
 
+/* Replace the XML character references and predefined entities in B
+   with the characters they stand for, and any other entity with a
+   space.  */
+static void
+decode_entities (struct buf *b)
+{
+  static const struct { const char *name; char c; } named[] = {
+    { "lt", '<' }, { "gt", '>' }, { "amp", '&' }, { "quot", '"' },
+    { "apos", '\'' }
+  };
+  size_t out = 0;
+
+  for (size_t i = 0; i < b->len; i++)
+    {
+      char *semi;
+      size_t n;
+
+      if (b->data[i] != '&'
+          || !(semi = memchr (b->data + i, ';', b->len - i < 12
+                              ? b->len - i : 12)))
+        {
+          b->data[out++] = b->data[i];
+          continue;
+        }
+      n = semi - (b->data + i + 1);
+      if (b->data[i + 1] == '#')
+        {
+          bool hex = b->data[i + 2] == 'x' || b->data[i + 2] == 'X';
+          unsigned long cp = strtoul (b->data + i + 2 + hex, NULL,
+                                      hex ? 16 : 10);
+
+          /* The UTF-8 encoding of CP is never longer than the
+             reference, so it fits in place.  */
+          if (cp == 0 || cp > 0x10FFFF)
+            b->data[out++] = ' ';
+          else if (cp < 0x80)
+            b->data[out++] = cp;
+          else if (cp < 0x800)
+            {
+              b->data[out++] = 0xC0 | cp >> 6;
+              b->data[out++] = 0x80 | (cp & 0x3F);
+            }
+          else if (cp < 0x10000)
+            {
+              b->data[out++] = 0xE0 | cp >> 12;
+              b->data[out++] = 0x80 | (cp >> 6 & 0x3F);
+              b->data[out++] = 0x80 | (cp & 0x3F);
+            }
+          else
+            {
+              b->data[out++] = 0xF0 | cp >> 18;
+              b->data[out++] = 0x80 | (cp >> 12 & 0x3F);
+              b->data[out++] = 0x80 | (cp >> 6 & 0x3F);
+              b->data[out++] = 0x80 | (cp & 0x3F);
+            }
+        }
+      else
+        {
+          char c = ' ';
+
+          for (size_t k = 0; k < sizeof named / sizeof *named; k++)
+            if (strlen (named[k].name) == n
+                && strncmp (b->data + i + 1, named[k].name, n) == 0)
+              c = named[k].c;
+          b->data[out++] = c;
+        }
+      i += n + 1;
+    }
+  b->len = out;
+  b->data[out] = '\0';
+}
+
 static bool
 starts_with (const char *s, const char *prefix)
 {
@@ -223,6 +295,203 @@ media_duration (const char *file)
     d = -1;
   buf_free (&out);
   return d;
+}
+
+/* Return the first start tag named NAME in S, or NULL.  */
+static const char *
+find_tag (const char *s, const char *name)
+{
+  size_t n = strlen (name);
+
+  for (; (s = strchr (s, '<')); s++)
+    if (strncmp (s + 1, name, n) == 0 && strchr (" \t\r\n/>", s[n + 1])
+        && s[n + 1] != '\0')
+      return s;
+  return NULL;
+}
+
+/* Return the value of the attribute NAME in the XML start tag that
+   begins at TAG, freshly allocated, or NULL.  */
+static char *
+xml_attr (const char *tag, const char *name)
+{
+  const char *end = strchr (tag, '>');
+  size_t n = strlen (name);
+
+  for (const char *p = tag; end && (p = strstr (p, name)) && p < end; p++)
+    {
+      const char *q = p + n;
+
+      if (p[-1] != ' ' && p[-1] != '\t' && p[-1] != '\n' && p[-1] != '\r')
+        continue;
+      while (*q == ' ')
+        q++;
+      if (*q++ != '=')
+        continue;
+      while (*q == ' ')
+        q++;
+      if (*q != '"' && *q != '\'')
+        continue;
+      const char *close = strchr (q + 1, *q);
+      if (!close || close > end)
+        return NULL;
+      char *v = xmalloc (close - q);
+      memcpy (v, q + 1, close - q - 1);
+      v[close - q - 1] = '\0';
+      return v;
+    }
+  return NULL;
+}
+
+/* Replace the %XX escapes in the URL path S, in place.  */
+static void
+url_unescape (char *s)
+{
+  char *out = s;
+
+  for (; *s; s++)
+    {
+      unsigned int c;
+
+      if (*s == '%' && sscanf (s + 1, "%2x", &c) == 1 && c != 0)
+        {
+          *out++ = c;
+          s += 2;
+        }
+      else
+        *out++ = *s;
+    }
+  *out = '\0';
+}
+
+/* Append up to MAX bytes of the member MEMBER of the zip archive FILE
+   to OUT.  */
+static void
+read_zip_member (const char *file, const char *member, struct buf *out,
+                 size_t max)
+{
+  struct buf name;
+
+  /* Escape the wildcards, so that unzip matches MEMBER exactly.  */
+  buf_init (&name);
+  for (; *member; member++)
+    {
+      if (strchr ("*?[]\\", *member))
+        buf_puts (&name, "\\");
+      buf_append (&name, member, 1);
+    }
+  const char *argv[] = { "unzip", "-p", file, name.data, NULL };
+  run_capture (argv, out, max);
+  buf_free (&name);
+}
+
+/* Append the text of the member MEMBER of the zip archive FILE, with
+   its markup stripped, to OUT, until OUT holds END bytes.  */
+static void
+append_zip_text (const char *file, const char *member, struct buf *out,
+                 size_t end)
+{
+  struct buf tmp;
+
+  if (out->len >= end)
+    return;
+  buf_init (&tmp);
+  read_zip_member (file, member, &tmp, 8 * MAX_CONTENT);
+  strip_markup (&tmp);
+  decode_entities (&tmp);
+  strip_markup (&tmp);
+  if (tmp.len > 0 && strcmp (tmp.data, " ") != 0)
+    buf_append (out, tmp.data, tmp.len < end - out->len ? tmp.len
+                : end - out->len);
+  buf_free (&tmp);
+}
+
+/* Append a textual rendering of the EPUB book FILE to OUT: its
+   metadata (title, author, description, subjects) and then the start
+   of its text, in reading order.  */
+static void
+extract_epub (const char *file, struct buf *out)
+{
+  struct buf tmp, opf;
+  const char *p, *spine;
+  char *opf_path = NULL;
+  size_t end = out->len + MAX_CONTENT, dir_len;
+
+  buf_init (&tmp);
+  read_zip_member (file, "META-INF/container.xml", &tmp, 16 * 1024);
+  if ((p = find_tag (tmp.data, "rootfile")))
+    opf_path = xml_attr (p, "full-path");
+  buf_free (&tmp);
+  if (!opf_path)
+    return;
+
+  /* The package document: its metadata, then its manifest and spine.  */
+  buf_init (&opf);
+  read_zip_member (file, opf_path, &opf, 1024 * 1024);
+  if ((p = find_tag (opf.data, "metadata"))
+      || (p = find_tag (opf.data, "opf:metadata")))
+    {
+      const char *stop = strstr (p + 9, "metadata>");
+
+      buf_init (&tmp);
+      buf_append (&tmp, p, stop ? (size_t) (stop - p) : strlen (p));
+      strip_markup (&tmp);
+      decode_entities (&tmp);
+      strip_markup (&tmp);
+      buf_append (out, tmp.data, tmp.len < MAX_CONTENT ? tmp.len
+                  : MAX_CONTENT);
+      buf_free (&tmp);
+    }
+
+  p = strrchr (opf_path, '/');
+  dir_len = p ? (size_t) (p - opf_path + 1) : 0;
+  /* The package elements may carry an opf: prefix.  */
+  const char *itemref = "itemref", *item_tag = "item";
+  spine = find_tag (opf.data, "spine");
+  if (!spine && (spine = find_tag (opf.data, "opf:spine")))
+    {
+      itemref = "opf:itemref";
+      item_tag = "opf:item";
+    }
+  for (p = spine; p && out->len < end && !interrupted
+         && (p = find_tag (p, itemref)); p++)
+    {
+      char *idref = xml_attr (p, "idref");
+      const char *item;
+
+      if (!idref)
+        continue;
+      /* Find the manifest item with that id.  */
+      for (item = opf.data; (item = find_tag (item, item_tag)); item++)
+        {
+          char *id;
+          bool match;
+
+          id = xml_attr (item, "id");
+          match = id && strcmp (id, idref) == 0;
+          free (id);
+          if (match)
+            break;
+        }
+      free (idref);
+      if (!item || item > spine)
+        continue;
+
+      char *href = xml_attr (item, "href");
+      if (!href)
+        continue;
+      url_unescape (href);
+      buf_init (&tmp);
+      buf_append (&tmp, opf_path, dir_len);
+      buf_puts (&tmp, href);
+      free (href);
+      if (out->len > 0 && out->data[out->len - 1] != ' ')
+        buf_puts (out, " ");
+      append_zip_text (file, tmp.data, out, end);
+      buf_free (&tmp);
+    }
+  buf_free (&opf);
+  free (opf_path);
 }
 
 /* Return the speech model, opening it if this is the first time it is
@@ -358,6 +627,8 @@ extract_content (const char *file, const char *mime, struct buf *out)
         }
       buf_free (&said);
     }
+  else if (strcmp (mime, "application/epub+zip") == 0)
+    extract_epub (file, out);
   else if (starts_with (mime, "application/vnd.openxmlformats")
            || starts_with (mime, "application/vnd.oasis.opendocument"))
     {

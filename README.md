@@ -9,8 +9,9 @@ models once.
 - Text is embedded by [nomic-embed-text-v1.5].  Each file becomes a
   short description of its name, location and type and, where
   possible, its content: plain text, PDF text, office document text
-  (OpenDocument and Office Open XML), OCR of images, audio and video
-  metadata, and a transcript of what is said.
+  (OpenDocument and Office Open XML), EPUB book metadata and text, OCR
+  of images, audio and video metadata, and a transcript of what is
+  said.
 - Images and videos are also embedded by what they show, with
   [nomic-embed-vision-v1.5], into the same space as the text, so a text
   query can find a photo.
