@@ -353,6 +353,86 @@ START_TEST (test_query_newest_record_wins)
 }
 END_TEST
 
+/* Write a chunk store, with lines given as a path, its MTIME (its
+   size is 1, as in make_store) and a keyword index, ending with NULL.
+   A keyword of -1 makes a line for a file that needs no chunks.  */
+static void
+make_chunks (const char *path, ...)
+{
+  struct buf b;
+  va_list ap;
+  char line[512];
+  char *p = path_join (fx.home, ".local/share/embed/chunks.txt");
+
+  buf_init (&b);
+  snprintf (line, sizeof line, "# embed-index chunks model=%s dim=%d\n",
+            EMBED_MODEL, FAKE_DIM);
+  buf_puts (&b, line);
+  va_start (ap, path);
+  for (const char *q = path; q; q = va_arg (ap, const char *))
+    {
+      int mtime = va_arg (ap, int), k = va_arg (ap, int);
+
+      if (k < 0)
+        snprintf (line, sizeof line, "%d 1 0 0\t%s\t-\n", mtime, q);
+      else
+        {
+          /* A scale of 1/127, then 127 along keyword K.  */
+          int n = snprintf (line, sizeof line, "%d 1 0 1\t%s\t%s", mtime,
+                            q, hex_float (1.0f / 127));
+          for (int i = 0; i < FAKE_DIM; i++)
+            n += snprintf (line + n, sizeof line - n, "%s",
+                           i == k ? "7f" : "00");
+          snprintf (line + n, sizeof line - n, "\n");
+        }
+      buf_puts (&b, line);
+    }
+  va_end (ap);
+  write_file (p, b.data, b.len);
+  buf_free (&b);
+  free (p);
+}
+
+START_TEST (test_query_chunk_raises_score)
+{
+  make_store (EMBED_MODEL, "/book", 0, "/notes", 2, NULL);
+  ck_assert_int_eq (run_query ("-s", "-n", "1", "invoice", NULL), 0);
+  ck_assert_ptr_null (strstr (out_text (), "0.992"));
+  make_chunks ("/book", 1, 1, "/notes", 1, -1, NULL);
+  ck_assert_int_eq (run_query ("-s", "-n", "1", "invoice", NULL), 0);
+  /* As high as a record along the query's keyword would score.  */
+  ck_assert_str_eq (out_text (), "0.992\t/book\n");
+  /* The record still counts.  */
+  ck_assert_int_eq (run_query ("-n", "1", "sourdough", NULL), 0);
+  ck_assert_str_eq (out_text (), "/book\n");
+}
+END_TEST
+
+START_TEST (test_query_ignores_stale_and_orphan_chunks)
+{
+  make_store (EMBED_MODEL, "/book", 0, "/notes", 2, NULL);
+  /* Of the book as it was, and of a file the store has forgotten.  */
+  make_chunks ("/book", 7, 1, "/gone", 1, 1, NULL);
+  ck_assert_int_eq (run_query ("-n", "5", "invoice", NULL), 0);
+  ck_assert_ptr_null (strstr (out_text (), "/gone"));
+  ck_assert_int_eq (run_query ("-s", "-n", "1", "invoice", NULL), 0);
+  ck_assert_ptr_null (strstr (out_text (), "0.992"));
+}
+END_TEST
+
+START_TEST (test_query_chunks_of_other_model_ignored)
+{
+  char *p = path_join (fx.home, ".local/share/embed/chunks.txt");
+
+  make_store (EMBED_MODEL, "/book", 0, NULL);
+  make_chunks ("/book", 1, 1, NULL);
+  write_file (p, "# embed-index chunks model=other dim=8\n", (size_t) -1);
+  ck_assert_int_eq (run_query ("-s", "invoice", NULL), 0);
+  ck_assert_ptr_null (strstr (out_text (), "0.992"));
+  free (p);
+}
+END_TEST
+
 START_TEST (test_query_stale_record_does_not_hide_match)
 {
   /* /a scored best, but its newer record scores badly: /c, rejected
@@ -605,6 +685,30 @@ START_TEST (test_round_trip_with_indexer)
   ck_assert (strstr (out_text (), "/Work/billing.txt\n"));
   ck_assert_int_eq (run_query ("-n", "1", "piano", "sonata", NULL), 0);
   ck_assert (strstr (out_text (), "/Music/playlist.m3u\n"));
+}
+END_TEST
+
+START_TEST (test_chunk_round_trip_with_indexer)
+{
+  struct buf b;
+  char *cmd;
+
+  /* A long document that names the sonata only far into it, and a
+     short one that names it beside an invoice.  */
+  buf_init (&b);
+  for (int i = 0; i < 400; i++)
+    buf_puts (&b, i >= 300 && i < 320 ? "sonata sonata sonata. "
+              : "Lorem ipsum dolor sit amet. ");
+  write_file (path_join (fx.home, "Books/novel.txt"), b.data, b.len);
+  write_file (path_join (fx.home, "Work/memo.txt"),
+              "Invoice for the sonata recital.", (size_t) -1);
+  if (asprintf (&cmd, "'%s' 2>/dev/null", EMBED_INDEX) < 0)
+    abort ();
+  ck_assert_int_eq (system (cmd), 0);
+
+  ck_assert_int_eq (run_query ("-n", "1", "sonata", NULL), 0);
+  ck_assert (strstr (out_text (), "/Books/novel.txt\n"));
+  buf_free (&b);
 }
 END_TEST
 
@@ -917,6 +1021,9 @@ query_suite (void)
   tcase_add_test (tc, test_query_skips_bad_lines);
   tcase_add_test (tc, test_query_newest_record_wins);
   tcase_add_test (tc, test_query_stale_record_does_not_hide_match);
+  tcase_add_test (tc, test_query_chunk_raises_score);
+  tcase_add_test (tc, test_query_ignores_stale_and_orphan_chunks);
+  tcase_add_test (tc, test_query_chunks_of_other_model_ignored);
   tcase_add_test (tc, test_query_paths_with_spaces);
   tcase_add_test (tc, test_query_empty_store);
   tcase_add_test (tc, test_query_missing_store);
@@ -932,6 +1039,7 @@ query_suite (void)
   tcase_add_test (tc, test_query_picture_scores_below_text);
   tcase_add_test (tc, test_query_bad_picture_vector);
   tcase_add_test (tc, test_round_trip_with_indexer);
+  tcase_add_test (tc, test_chunk_round_trip_with_indexer);
   tcase_add_test (tc, test_file_uses_fresh_record);
   tcase_add_test (tc, test_file_stale_record_embeds_file);
   tcase_add_test (tc, test_file_not_indexed);

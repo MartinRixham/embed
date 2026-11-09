@@ -202,8 +202,12 @@ run_search (const char *text, GPtrArray *results)
   latest = find_latest (f, &n_latest, NULL, NULL);
   if (fseek (f, data_start, SEEK_SET) == 0)
     {
-      matches = search_records (f, latest, n_latest, &q, dim, NULL, count,
-                                &used);
+      FILE *chunks = open_chunks (dim);
+
+      matches = search_records (f, latest, n_latest, &q, dim, NULL, chunks,
+                                count, &used);
+      if (chunks)
+        fclose (chunks);
       for (size_t i = 0; i < used; i++)
         if (matches[i].score >= min_score)
           g_ptr_array_add (results, g_strdup (matches[i].path));

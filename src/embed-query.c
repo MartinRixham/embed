@@ -180,7 +180,7 @@ main (int argc, char **argv)
   struct stat st;
   size_t n_latest;
   long data_start;
-  FILE *f;
+  FILE *f, *chunks;
   int c;
 
   while ((c = getopt_long (argc, argv, "f:n:s", long_options, NULL)) != -1)
@@ -270,9 +270,12 @@ main (int argc, char **argv)
                "%zu", qdim, dim);
     }
   query_prepare (&q, dim);
-  matches = search_records (f, latest, n_latest, &q, dim, file_ids, count,
-                            &used);
+  chunks = open_chunks (dim);
+  matches = search_records (f, latest, n_latest, &q, dim, file_ids, chunks,
+                            count, &used);
   fclose (f);
+  if (chunks)
+    fclose (chunks);
 
   for (size_t i = 0; i < used; i++)
     {

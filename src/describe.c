@@ -28,6 +28,19 @@
 /* How much file content to feed the model, in bytes.  */
 #define MAX_CONTENT 1500
 
+/* The size of a chunk: a passage of a long file, embedded on its own,
+   as large as the content in a file's description.  */
+#define CHUNK_BYTES MAX_CONTENT
+
+/* How much of a file's text to split into chunks at most, in bytes.  */
+#define CHUNK_TEXT_MAX (4 << 20)
+
+/* The most chunks to embed of a long document, and of any other long
+   text, such as code or data, which is less often searched for by
+   what one passage of it says.  */
+#define CHUNKS_PROSE 64
+#define CHUNKS_OTHER 4
+
 /* How many frames of a video to embed; their average stands for the
    video.  */
 #define VIDEO_FRAMES 8
@@ -396,7 +409,8 @@ append_zip_text (const char *file, const char *member, struct buf *out,
   if (out->len >= end)
     return;
   buf_init (&tmp);
-  read_zip_member (file, member, &tmp, 8 * MAX_CONTENT);
+  /* Markup takes room too: allow for a page of it or so.  */
+  read_zip_member (file, member, &tmp, 4 * (end - out->len) + 16384);
   strip_markup (&tmp);
   decode_entities (&tmp);
   strip_markup (&tmp);
@@ -410,12 +424,12 @@ append_zip_text (const char *file, const char *member, struct buf *out,
    metadata (title, author, description, subjects) and then the start
    of its text, in reading order.  */
 static void
-extract_epub (const char *file, struct buf *out)
+extract_epub (const char *file, struct buf *out, size_t limit)
 {
   struct buf tmp, opf;
   const char *p, *spine;
   char *opf_path = NULL;
-  size_t end = out->len + MAX_CONTENT, dir_len;
+  size_t end = out->len + limit, dir_len;
 
   buf_init (&tmp);
   read_zip_member (file, "META-INF/container.xml", &tmp, 16 * 1024);
@@ -438,8 +452,7 @@ extract_epub (const char *file, struct buf *out)
       strip_markup (&tmp);
       decode_entities (&tmp);
       strip_markup (&tmp);
-      buf_append (out, tmp.data, tmp.len < MAX_CONTENT ? tmp.len
-                  : MAX_CONTENT);
+      buf_append (out, tmp.data, tmp.len < limit ? tmp.len : limit);
       buf_free (&tmp);
     }
 
@@ -581,16 +594,41 @@ transcribe (struct speech *sp, const char *file, struct buf *out)
     }
 }
 
-/* Append a textual rendering of the content of FILE, of type MIME, to
-   OUT.  */
+/* Append up to LIMIT bytes of the text of the office document FILE,
+   of type MIME, to OUT.  */
 static void
-extract_content (const char *file, const char *mime, struct buf *out)
+extract_office (const char *file, const char *mime, struct buf *out,
+                size_t limit)
 {
+  const char *member = "content.xml";
   struct buf tmp;
 
+  if (strstr (mime, "wordprocessingml"))
+    member = "word/document.xml";
+  else if (strstr (mime, "presentationml"))
+    member = "ppt/slides/slide*.xml";
+  else if (strstr (mime, "spreadsheetml"))
+    member = "xl/sharedStrings.xml";
+
+  const char *argv[] = { "unzip", "-p", file, member, NULL };
+  buf_init (&tmp);
+  run_capture (argv, &tmp, 4 * limit);
+  strip_markup (&tmp);
+  buf_append (out, tmp.data, tmp.len < limit ? tmp.len : limit);
+  buf_free (&tmp);
+}
+
+/* Append a textual rendering of the content of FILE, of type MIME, to
+   OUT: up to LIMIT bytes of it.  If WHOLE, it is for chunks, so render
+   all of a PDF, and nothing of images and recordings, whose content is
+   not text that runs on.  */
+static void
+extract_upto (const char *file, const char *mime, struct buf *out,
+              size_t limit, bool whole)
+{
   if (textual_mime (mime))
     {
-      read_head (file, out, MAX_CONTENT);
+      read_head (file, out, limit);
       if (strcmp (mime, "text/html") == 0 || ends_with (mime, "xml"))
         strip_markup (out);
     }
@@ -598,7 +636,17 @@ extract_content (const char *file, const char *mime, struct buf *out)
     {
       const char *argv[] = { "pdftotext", "-q", "-l", "2", "-enc", "UTF-8",
                              file, "-", NULL };
-      run_capture (argv, out, MAX_CONTENT);
+      const char *all[] = { "pdftotext", "-q", "-enc", "UTF-8", file, "-",
+                            NULL };
+      run_capture (whole ? all : argv, out, limit);
+    }
+  else if (whole)
+    {
+      if (strcmp (mime, "application/epub+zip") == 0)
+        extract_epub (file, out, limit);
+      else if (starts_with (mime, "application/vnd.openxmlformats")
+               || starts_with (mime, "application/vnd.oasis.opendocument"))
+        extract_office (file, mime, out, limit);
     }
   else if (starts_with (mime, "image/"))
     {
@@ -628,27 +676,165 @@ extract_content (const char *file, const char *mime, struct buf *out)
       buf_free (&said);
     }
   else if (strcmp (mime, "application/epub+zip") == 0)
-    extract_epub (file, out);
+    extract_epub (file, out, limit);
   else if (starts_with (mime, "application/vnd.openxmlformats")
            || starts_with (mime, "application/vnd.oasis.opendocument"))
+    extract_office (file, mime, out, limit);
+}
+
+/* Append a textual rendering of the content of FILE, of type MIME, to
+   OUT: as much as goes into its description.  */
+static void
+extract_content (const char *file, const char *mime, struct buf *out)
+{
+  extract_upto (file, mime, out, MAX_CONTENT, false);
+}
+
+/* Return the most chunks to embed of a file of type MIME: 0 if its
+   content is not running text.  */
+static size_t
+chunk_cap (const char *mime)
+{
+  static const char *const prose[] = {
+    "application/pdf", "application/epub+zip", "text/plain",
+    "text/markdown", "text/x-markdown", "text/html", "text/rtf",
+    "text/x-tex", "text/troff", "message/rfc822", NULL
+  };
+
+  for (size_t i = 0; prose[i]; i++)
+    if (strcmp (mime, prose[i]) == 0)
+      return CHUNKS_PROSE;
+  if (starts_with (mime, "application/vnd.openxmlformats")
+      || starts_with (mime, "application/vnd.oasis.opendocument"))
+    return CHUNKS_PROSE;
+  if (textual_mime (mime))
+    return CHUNKS_OTHER;
+  return 0;
+}
+
+/* Return the number of windows of CHUNK_BYTES in LEN bytes of text,
+   counting a last partial one.  */
+static size_t
+n_windows (size_t len)
+{
+  return (len + CHUNK_BYTES - 1) / CHUNK_BYTES;
+}
+
+size_t
+chunk_plan (size_t text_len, size_t cap)
+{
+  size_t n = n_windows (text_len);
+
+  /* The first window is in the file's own description already.  */
+  if (n < 2)
+    return 0;
+  return n - 1 < cap ? n - 1 : cap;
+}
+
+size_t
+chunk_text (magic_t magic_mime, const char *file, long long size,
+            struct buf *out)
+{
+  const char *m = magic_file (magic_mime, file);
+  char *mime;
+  size_t cap, k;
+  long saved = helper_timeout;
+
+  if (!m || !(cap = chunk_cap (m)))
+    return 0;
+  /* Plain text is no longer than the file.  */
+  if (textual_mime (m) && size <= CHUNK_BYTES)
+    return 0;
+  mime = xstrdup (m);
+  /* Rendering the whole of a book takes longer than its start.  */
+  helper_timeout = saved * 15;
+  extract_upto (file, mime, out, CHUNK_TEXT_MAX, true);
+  helper_timeout = saved;
+  free (mime);
+  k = chunk_plan (out->len, cap);
+  return k;
+}
+
+/* Return the I'th of the slots 0 to K - 1 in the order chunks are
+   embedded: the bit-reversed order, so that the first few chunks are
+   spread through the whole file, and later ones fall between them.  */
+static size_t
+chunk_slot (size_t k, size_t i)
+{
+  unsigned bits = 0;
+
+  while (((size_t) 1 << bits) < k)
+    bits++;
+  for (size_t t = 0, seen = 0; t < (size_t) 1 << bits; t++)
     {
-      const char *member = "content.xml";
+      size_t j = 0;
 
-      if (strstr (mime, "wordprocessingml"))
-        member = "word/document.xml";
-      else if (strstr (mime, "presentationml"))
-        member = "ppt/slides/slide*.xml";
-      else if (strstr (mime, "spreadsheetml"))
-        member = "xl/sharedStrings.xml";
-
-      const char *argv[] = { "unzip", "-p", file, member, NULL };
-      buf_init (&tmp);
-      run_capture (argv, &tmp, 4 * MAX_CONTENT);
-      strip_markup (&tmp);
-      buf_append (out, tmp.data, tmp.len < MAX_CONTENT ? tmp.len
-                  : MAX_CONTENT);
-      buf_free (&tmp);
+      for (unsigned b = 0; b < bits; b++)
+        if (t & (size_t) 1 << b)
+          j |= (size_t) 1 << (bits - 1 - b);
+      if (j < k && seen++ == i)
+        return j;
     }
+  return 0;
+}
+
+/* Whether C is white space.  */
+static bool
+is_space (char c)
+{
+  return c == ' ' || c == '\n' || c == '\t' || c == '\r';
+}
+
+/* Return AT, an offset into TEXT of LEN bytes, moved forward to the
+   start of a word, looking at most a little way ahead, or else to the
+   start of a UTF-8 character.  */
+static size_t
+word_start (const char *text, size_t len, size_t at)
+{
+  for (size_t p = at; p < len && p < at + 200; p++)
+    if (p == 0 || is_space (text[p - 1]))
+      return p;
+  while (at < len && ((unsigned char) text[at] & 0xC0) == 0x80)
+    at++;
+  return at;
+}
+
+void
+chunk_window (const struct buf *text, size_t k, size_t i, size_t *start,
+              size_t *end)
+{
+  size_t n = n_windows (text->len);
+  size_t w = 1 + chunk_slot (k, i) * (n - 1) / k;
+
+  *start = word_start (text->data, text->len, w * CHUNK_BYTES);
+  *end = w * CHUNK_BYTES + CHUNK_BYTES;
+  if (*end >= text->len)
+    *end = text->len;
+  else
+    *end = word_start (text->data, text->len, *end);
+  if (*end < *start)
+    *end = *start;
+}
+
+bool
+embed_chunk (struct model *m, const char *file, const struct buf *text,
+             size_t k, size_t i, size_t dim, float **vec)
+{
+  const char *name = strrchr (file, '/');
+  struct buf b;
+  size_t start, end;
+  bool ok;
+
+  chunk_window (text, k, i, &start, &end);
+  buf_init (&b);
+  buf_puts (&b, DOCUMENT_PREFIX);
+  buf_puts (&b, "From the file ");
+  buf_puts (&b, name ? name + 1 : file);
+  buf_puts (&b, ":\n\n");
+  buf_append (&b, text->data + start, end - start);
+  ok = embed_checked (m, b.data, dim, vec);
+  buf_free (&b);
+  return ok;
 }
 
 /* Decode one frame of FILE, from AT seconds in if AT is not negative,

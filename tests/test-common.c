@@ -303,6 +303,50 @@ START_TEST (test_hex_vector_rejects)
 }
 END_TEST
 
+START_TEST (test_q8_vector_round_trip)
+{
+  float in[] = { 0.5f, -0.25f, 0.001f, 0.0f, -0.5f, 1.0f / 3 };
+  size_t n = sizeof in / sizeof *in;
+  float out[sizeof in / sizeof *in];
+  char *text;
+  size_t len;
+  FILE *f = open_memstream (&text, &len);
+
+  write_q8_vector (f, in, n);
+  fclose (f);
+  ck_assert_uint_eq (len, 8 + 2 * n);
+  /* The largest component is exactly 127 steps.  */
+  ck_assert (strncmp (text + 8, "7fc0", 4) == 0);
+  ck_assert (parse_q8_vector (text, out, n));
+  for (size_t i = 0; i < n; i++)
+    ck_assert_double_eq_tol (out[i], in[i], 0.5 / 127 * 0.5 + 1e-6);
+  free (text);
+}
+END_TEST
+
+START_TEST (test_q8_vector_zero_and_rejects)
+{
+  float zero[2] = { 0, 0 }, v[2];
+  char *text;
+  size_t len;
+  FILE *f = open_memstream (&text, &len);
+
+  write_q8_vector (f, zero, 2);
+  fclose (f);
+  ck_assert (parse_q8_vector (text, v, 2));
+  ck_assert_float_eq (v[0], 0);
+  ck_assert_float_eq (v[1], 0);
+  ck_assert (parse_q8_vector ("3c0102047f81\n", v, 2));
+  ck_assert_float_eq_tol (v[0], 1, 1e-3);
+  ck_assert_float_eq_tol (v[1], -1, 1e-3);
+  ck_assert (!parse_q8_vector ("3c0102047f", v, 2));
+  ck_assert (!parse_q8_vector ("3c0102047f8100", v, 2));
+  ck_assert (!parse_q8_vector ("3c0102047fzz", v, 2));
+  ck_assert (!parse_q8_vector ("-", v, 2));
+  free (text);
+}
+END_TEST
+
 START_TEST (test_parse_positive)
 {
   long v = -7;
@@ -360,6 +404,8 @@ common_suite (void)
   tcase_add_test (tc, test_hex_vector_round_trip);
   tcase_add_test (tc, test_hex_vector_accepts_case_and_newline);
   tcase_add_test (tc, test_hex_vector_rejects);
+  tcase_add_test (tc, test_q8_vector_round_trip);
+  tcase_add_test (tc, test_q8_vector_zero_and_rejects);
   tcase_add_test (tc, test_make_parent_dirs);
   tcase_add_exit_test (tc, test_make_parent_dirs_blocked, EXIT_FAILURE);
   suite_add_tcase (s, tc);

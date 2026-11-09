@@ -61,6 +61,10 @@ char *data_path (const char *name);
 /* Return the path of the embedding store, freshly allocated.  */
 char *store_path (void);
 
+/* Return the path of the chunk store, freshly allocated: the vectors
+   of passages spread through long files; see embed-index.c.  */
+char *chunk_store_path (void);
+
 /* Parse the store header line LINE.  Store the model name in MODEL
    (at most MODEL_SIZE bytes) and the dimension in *DIM.  */
 bool parse_header (const char *line, char *model, size_t model_size,
@@ -75,5 +79,16 @@ void write_hex_vector (FILE *f, const float *vec, size_t dim);
    floats of VEC.  Return false unless S holds exactly DIM * 8 hex
    digits followed by a newline or the end of the string.  */
 bool parse_hex_vector (const char *s, float *vec, size_t dim);
+
+/* Write the DIM floats of VEC to F compactly, to within about 1% of
+   its largest component: the 8 hex digits of a float scale (as by
+   write_hex_vector), then each component divided by the scale and
+   rounded to a signed byte, as 2 hex digits.  */
+void write_q8_vector (FILE *f, const float *vec, size_t dim);
+
+/* Decode a vector written by write_q8_vector from S into the DIM floats
+   of VEC.  Return false unless S holds exactly 8 + DIM * 2 hex digits
+   followed by a newline or the end of the string.  */
+bool parse_q8_vector (const char *s, float *vec, size_t dim);
 
 #endif /* EMBED_COMMON_H */

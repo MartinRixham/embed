@@ -16,6 +16,12 @@ models once.
   [nomic-embed-vision-v1.5], into the same space as the text, so a text
   query can find a photo.
 - Speech in audio and video is transcribed by [Whisper] (base).
+- Long files are also embedded in chunks: passages spread through the
+  text, each embedded on its own, so that a search finds a book by
+  what one chapter says.  A file scores the best of its vectors.
+  Documents get up to 64 chunks and other text, such as code, up to 4.
+  The chunks are embedded a little at a time, after new and changed
+  files, and each run carries on where the last one stopped.
 
 The models run on the GPU through OpenVINO when there is a usable one,
 and otherwise on the CPU through ONNX Runtime.
@@ -26,11 +32,14 @@ and otherwise on the CPU through ONNX Runtime.
 
 ## Programs
 
-**embed-index** `[-a] [-v] [--cpu] [DIRECTORY]...` embeds every file
-under each directory (by default `$HOME`), leaving out hidden files
-unless `-a` is given.  Files whose size and modification time are
-unchanged since the last run are skipped, so it is cheap to rerun.  An
-interrupted run keeps what it has done.
+**embed-index** `[-a] [-v] [--cpu] [--chunk-time=SECONDS]
+[DIRECTORY]...` embeds every file under each directory (by default
+`$HOME`), leaving out hidden files unless `-a` is given.  Files whose
+size and modification time are unchanged since the last run are
+skipped, so it is cheap to rerun.  It then spends up to
+`--chunk-time` seconds (default 600) embedding chunks, starting with
+the files that have fewest.  An interrupted run keeps what it has
+done.
 
 **embed-query** `[-n N] [-s] QUERY...` lists the files that best match
 the query, best first.  With `--file=FILE` it lists the files most like
@@ -74,6 +83,7 @@ yourself.
 | Path                                   | What                         |
 |----------------------------------------|------------------------------|
 | `~/.local/share/embed/embeddings.txt`  | the store, one file per line |
+| `~/.local/share/embed/chunks.txt`      | chunks, one per line         |
 | `~/.local/share/embed/models/`         | downloaded models (~750 MB)  |
 | `~/.cache/embed/openvino/`             | OpenVINO's compiled kernels  |
 

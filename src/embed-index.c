@@ -23,6 +23,24 @@
    where the picture vector is "-" for a file that has none.  The
    version of the record format is always 1 for now; it is written
    but not yet read.
+
+   A long file is also embedded in chunks: passages spread through its
+   text, each embedded on its own, so that a search can find it by what
+   one part of it says.  A search scores a file by the best of its
+   vectors.  There are many chunks, so they are embedded a few at a
+   time, after the files that are new or changed, for as long as
+   --chunk-time allows, each run carrying on where the last left off
+   and starting with the files that have fewest so far.  The first
+   chunks of a file are spread through the whole of it, and later ones
+   fall between them.  They are kept in
+   ~/.local/share/embed/chunks.txt, one chunk per line:
+
+     MTIME SIZE I K <tab> PATH <tab> VECTOR
+
+   for the I'th chunk of the K to embed of the file as it was at MTIME
+   and SIZE, with its vector stored compactly by write_q8_vector.  A
+   file that needs no chunks has the single line I = K = 0 and VECTOR
+   "-", so that it is not looked at again until it changes.
    Files whose size and modification time are unchanged since the last
    run are skipped, so the program can be rerun cheaply.  Only one run
    at a time may work on the store, since each rewrites it at the end
@@ -45,6 +63,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 /* The version of the record format; see above.  */
@@ -58,7 +77,43 @@ struct entry
   long long size;
   size_t line;                  /* Line number of the newest record.  */
   bool seen;                    /* Found during this run's walk.  */
+  bool changed;                 /* Embedded afresh during this run.  */
+  bool chunks_reset;            /* Its chunks are being redone.  */
+  long chunk_total;             /* Chunks to embed, or -1 if unknown.  */
+  size_t chunk_done;            /* Chunks embedded so far.  */
 };
+
+/* A file whose chunks may still need embedding.  */
+struct candidate
+{
+  char *path;
+  long long mtime;
+  long long size;
+  struct entry *e;              /* Its entry in the old store, if any.  */
+  long total;                   /* Chunks to embed, or -1 if unknown.  */
+  size_t done;                  /* Chunks embedded so far.  */
+  bool skip;                    /* Changed or unreadable: leave it.  */
+};
+
+/* How many chunks of one file to embed before turning to the next.  */
+#define CHUNK_BATCH 8
+
+/* How long a run may spend on chunks by default, in seconds.  */
+#define DEFAULT_CHUNK_TIME 600
+
+static struct candidate *candidates;
+static size_t n_candidates, candidates_cap;
+
+/* An owner of a chunk line that is no entry: a line written during
+   this run, or one to drop.  */
+#define CHUNK_NEW ((size_t) -1)
+#define CHUNK_DROP ((size_t) -2)
+
+/* For each line of the chunk store, the entry whose chunk it is, or
+   CHUNK_NEW or CHUNK_DROP.  The header is CHUNK_NEW.  */
+static size_t *chunk_owner;
+static size_t n_chunk_lines, chunk_owner_cap;
+static bool chunks_unterminated;
 
 static struct entry *entries;
 static size_t n_entries;
@@ -73,10 +128,12 @@ static bool store_unterminated;
 
 static bool verbose;
 static bool include_hidden;
+static long chunk_time = DEFAULT_CHUNK_TIME;
 
 static struct option const long_options[] = {
   {"all", no_argument, NULL, 'a'},
   {"cpu", no_argument, NULL, 'c'},
+  {"chunk-time", required_argument, NULL, 't'},
   {"verbose", no_argument, NULL, 'v'},
   {"help", no_argument, NULL, 'h'},
   {"version", no_argument, NULL, 'V'},
@@ -97,13 +154,19 @@ usage (int status)
           "Images and videos are also embedded by what they show, with "
           "%s,\nand speech in audio and video is transcribed by %s.\n\n"
           "  -a, --all            include hidden files and directories\n"
+          "      --chunk-time=SECONDS  spend at most SECONDS embedding "
+          "passages of\n"
+          "                       long files, after new and changed "
+          "files (default %d;\n"
+          "                       0 for none)\n"
           "      --cpu            run the model on the CPU even if there is "
           "a GPU\n"
           "  -v, --verbose        print each file as it is embedded\n"
           "      --help           display this help and exit\n"
           "      --version        output version information and exit\n\n"
-          "Embeddings are stored in ~/.local/share/embed/embeddings.txt.\n",
-          EMBED_MODEL, VISION_MODEL, SPEECH_MODEL);
+          "Embeddings are stored in ~/.local/share/embed/embeddings.txt,\n"
+          "and those of passages in ~/.local/share/embed/chunks.txt.\n",
+          EMBED_MODEL, VISION_MODEL, SPEECH_MODEL, DEFAULT_CHUNK_TIME);
   exit (status);
 }
 
@@ -205,6 +268,10 @@ load_store (const char *path, char *model, size_t model_size)
       entries[n_entries].size = size;
       entries[n_entries].line = n_lines - 1;
       entries[n_entries].seen = false;
+      entries[n_entries].changed = false;
+      entries[n_entries].chunks_reset = false;
+      entries[n_entries].chunk_total = -1;
+      entries[n_entries].chunk_done = 0;
       n_entries++;
     }
   free (line);
@@ -227,6 +294,80 @@ load_store (const char *path, char *model, size_t model_size)
   n_entries = out;
   for (size_t i = 0; i < n_entries; i++)
     keep[entries[i].line] = 1;
+  return true;
+}
+
+static void
+chunk_owner_push (size_t owner)
+{
+  if (n_chunk_lines == chunk_owner_cap)
+    {
+      chunk_owner_cap = chunk_owner_cap ? 2 * chunk_owner_cap : 4096;
+      chunk_owner = xrealloc (chunk_owner,
+                              chunk_owner_cap * sizeof *chunk_owner);
+    }
+  chunk_owner[n_chunk_lines++] = owner;
+}
+
+/* Load the chunk store at PATH, for a store of vectors of DIM floats,
+   and note against each entry how far its chunks have got.  Return
+   false if there is no usable chunk store, so that it must be begun
+   afresh.  */
+static bool
+load_chunks (const char *path, size_t dim)
+{
+  FILE *f = fopen (path, "r");
+  char *line = NULL, model[256];
+  size_t line_size = 0, d;
+  ssize_t len;
+  bool ok;
+
+  n_chunk_lines = 0;
+  if (!f)
+    {
+      if (errno != ENOENT)
+        error (EXIT_FAILURE, errno, "%s", path);
+      return false;
+    }
+  len = getline (&line, &line_size, f);
+  ok = len > 0 && line[len - 1] == '\n'
+    && parse_header (line, model, sizeof model, &d)
+    && strcmp (model, EMBED_MODEL) == 0 && d == dim;
+  if (!ok)
+    {
+      free (line);
+      fclose (f);
+      return false;
+    }
+  chunk_owner_push (CHUNK_NEW);
+  chunks_unterminated = false;
+
+  while ((len = getline (&line, &line_size, f)) > 0)
+    {
+      long long mtime, size;
+      long i, k;
+      char *tab1, *tab2;
+      struct entry *e;
+
+      chunk_owner_push (CHUNK_DROP);
+      chunks_unterminated = line[len - 1] != '\n';
+      if (chunks_unterminated
+          || sscanf (line, "%lld %lld %ld %ld", &mtime, &size, &i, &k) != 4
+          || !(tab1 = strchr (line, '\t'))
+          || !(tab2 = strchr (tab1 + 1, '\t')))
+        continue;
+      *tab2 = '\0';
+      e = find_entry (tab1 + 1);
+      if (!e || e->mtime != mtime || e->size != size || k < 0
+          || (e->chunk_total >= 0 && e->chunk_total != k))
+        continue;
+      chunk_owner[n_chunk_lines - 1] = e - entries;
+      e->chunk_total = k;
+      if (tab2[1] != '-')
+        e->chunk_done++;
+    }
+  free (line);
+  fclose (f);
   return true;
 }
 
@@ -263,9 +404,10 @@ under_root (const char *path, char *const *roots)
   return false;
 }
 
-/* Rewrite the store at PATH keeping only lines marked in KEEP.  */
+/* Rewrite the file at PATH keeping only the complete lines among its
+   first N for which KEEP_LINE is nonzero.  */
 static void
-compact_store (const char *path)
+compact_file (const char *path, const char *keep_line, size_t n_keep)
 {
   struct buf tmp_path;
   FILE *in, *out;
@@ -286,7 +428,7 @@ compact_store (const char *path)
 
   while ((len = getline (&line, &line_size, in)) > 0)
     {
-      if (n < n_lines && keep[n] && line[len - 1] == '\n')
+      if (n < n_keep && keep_line[n] && line[len - 1] == '\n')
         fwrite (line, 1, len, out);
       n++;
     }
@@ -297,6 +439,219 @@ compact_store (const char *path)
   if (rename (tmp_path.data, path) != 0)
     error (EXIT_FAILURE, errno, "cannot replace %s", path);
   buf_free (&tmp_path);
+}
+
+/* Rewrite the store at PATH keeping only lines marked in KEEP.  */
+static void
+compact_store (const char *path)
+{
+  compact_file (path, keep, n_lines);
+}
+
+/* Rewrite the chunk store at PATH keeping only the chunks of files as
+   they are now in the store.  */
+static void
+compact_chunks (const char *path)
+{
+  char *k = xmalloc (n_chunk_lines + 1);
+
+  for (size_t i = 0; i < n_chunk_lines; i++)
+    {
+      size_t o = chunk_owner[i];
+
+      k[i] = o == CHUNK_NEW
+        || (o != CHUNK_DROP && keep[entries[o].line]
+            && !entries[o].changed && !entries[o].chunks_reset);
+    }
+  compact_file (path, k, n_chunk_lines);
+  free (k);
+}
+
+/* Note that the chunks of the file at PATH, of the given MTIME and
+   SIZE, whose entry in the old store is E, if any, may still need
+   embedding.  */
+static void
+add_candidate (const char *path, long long mtime, long long size,
+               struct entry *e, long total, size_t done)
+{
+  struct candidate *c;
+
+  if (n_candidates == candidates_cap)
+    {
+      candidates_cap = candidates_cap ? 2 * candidates_cap : 1024;
+      candidates = xrealloc (candidates,
+                             candidates_cap * sizeof *candidates);
+    }
+  c = &candidates[n_candidates++];
+  c->path = xstrdup (path);
+  c->mtime = mtime;
+  c->size = size;
+  c->e = e;
+  c->total = total;
+  c->done = done;
+  c->skip = false;
+}
+
+/* Fewest chunks first, so that every file gets some before any gets
+   many.  */
+static int
+compare_candidates (const void *a, const void *b)
+{
+  const struct candidate *x = a, *y = b;
+
+  if (x->done != y->done)
+    return x->done < y->done ? -1 : 1;
+  return strcmp (x->path, y->path);
+}
+
+static double
+now (void)
+{
+  struct timespec ts;
+
+  clock_gettime (CLOCK_MONOTONIC, &ts);
+  return ts.tv_sec + ts.tv_nsec / 1e9;
+}
+
+/* Write a chunk store line for chunk I of K of C, with the vector VEC,
+   or "-" if VEC is NULL, to F.  */
+static void
+write_chunk (FILE *f, const struct candidate *c, size_t i, size_t k,
+             const float *vec, size_t dim, const char *path)
+{
+  fprintf (f, "%lld %lld %zu %zu\t%s\t", c->mtime, c->size, i, k, c->path);
+  if (vec)
+    write_q8_vector (f, vec, dim);
+  else
+    putc ('-', f);
+  putc ('\n', f);
+  if (fflush (f) != 0 || ferror (f))
+    error (EXIT_FAILURE, errno, "%s", path);
+  chunk_owner_push (CHUNK_NEW);
+}
+
+/* Embed the next few chunks of C with M into F, the chunk store at
+   PATH, until DEADLINE.  Return how many were embedded.  */
+static size_t
+chunk_candidate (struct candidate *c, struct model *m, magic_t magic_mime,
+                 size_t dim, double deadline, FILE *f, const char *path)
+{
+  struct stat st;
+  struct buf text;
+  size_t k, i, n = 0;
+
+  if (lstat (c->path, &st) != 0 || !S_ISREG (st.st_mode)
+      || st.st_mtime != c->mtime || st.st_size != c->size)
+    {
+      /* Changed since the walk: the next run embeds it afresh.  */
+      c->skip = true;
+      return 0;
+    }
+
+  buf_init (&text);
+  k = chunk_text (magic_mime, c->path, c->size, &text);
+  if (k == 0 && c->total > 0)
+    {
+      /* It had text before, so this is likely a helper timing out.  */
+      c->skip = true;
+      buf_free (&text);
+      return 0;
+    }
+  if (c->total >= 0 && (size_t) c->total != k)
+    {
+      /* Rendered differently from before, say by a newer helper, so
+         its chunks would fall elsewhere: begin them again.  */
+      if (c->e)
+        c->e->chunks_reset = true;
+      c->done = 0;
+    }
+  c->total = k;
+  if (k == 0)
+    {
+      write_chunk (f, c, 0, 0, NULL, dim, path);
+      buf_free (&text);
+      return 0;
+    }
+
+  if (verbose)
+    fprintf (stderr, "%s: chunks from %zu of %zu\n", c->path, c->done + 1, k);
+  for (i = c->done; i < k && i < c->done + CHUNK_BATCH && !interrupted
+         && now () < deadline; i++)
+    {
+      float *vec;
+
+      if (!embed_chunk (m, c->path, &text, k, i, dim, &vec))
+        {
+          error (0, 0, "%s: could not embed chunk %zu", c->path, i + 1);
+          c->skip = true;
+          break;
+        }
+      write_chunk (f, c, i, k, vec, dim, path);
+      free (vec);
+      n++;
+    }
+  c->done = i;
+  buf_free (&text);
+  return n;
+}
+
+/* Embed chunks of the candidates with M, for at most chunk_time
+   seconds, into the chunk store at PATH, which is begun afresh unless
+   HAVE_CHUNKS.  Return how many were embedded.  */
+static size_t
+embed_chunks (struct model *m, magic_t magic_mime, size_t dim,
+              const char *path, bool have_chunks)
+{
+  double deadline = now () + chunk_time;
+  size_t n = 0;
+  bool progress = true;
+  FILE *f;
+
+  if (have_chunks)
+    {
+      f = fopen (path, "a");
+      if (f && chunks_unterminated)
+        putc ('\n', f);
+    }
+  else
+    {
+      make_parent_dirs (path);
+      f = fopen (path, "w");
+      n_chunk_lines = 0;
+      if (f)
+        {
+          fprintf (f, "# embed-index chunks model=%s dim=%zu\n",
+                   EMBED_MODEL, dim);
+          chunk_owner_push (CHUNK_NEW);
+        }
+    }
+  if (!f)
+    error (EXIT_FAILURE, errno, "%s", path);
+
+  if (n_candidates > 0)
+    qsort (candidates, n_candidates, sizeof *candidates,
+           compare_candidates);
+  while (progress && !interrupted && now () < deadline)
+    {
+      progress = false;
+      for (size_t i = 0; i < n_candidates && !interrupted
+             && now () < deadline; i++)
+        {
+          struct candidate *c = &candidates[i];
+
+          if (c->skip || (c->total >= 0 && c->done >= (size_t) c->total))
+            continue;
+          n += chunk_candidate (c, m, magic_mime, dim, deadline, f, path);
+          progress = true;
+          if (!verbose && isatty (STDERR_FILENO) && n > 0)
+            fprintf (stderr, "\rchunks %zu", n);
+        }
+    }
+  if (!verbose && isatty (STDERR_FILENO) && n > 0)
+    fputc ('\n', stderr);
+  if (fclose (f) != 0)
+    error (EXIT_FAILURE, errno, "%s", path);
+  return n;
 }
 
 /* The exit status when another run holds the lock, so that a timer can
@@ -329,6 +684,7 @@ main (int argc, char **argv)
 {
   char store_model[256];
   char *store = store_path ();
+  char *chunks = chunk_store_path ();
   char *store_dir;
   const char *home = getenv ("HOME");
   char *default_roots[2];
@@ -338,9 +694,9 @@ main (int argc, char **argv)
   FILE *out;
   FTS *fts;
   FTSENT *ent;
-  size_t dim = 0, n_new = 0, n_same = 0, n_failed = 0;
+  size_t dim = 0, n_new = 0, n_same = 0, n_failed = 0, n_chunks = 0;
   float *vec;
-  bool have_store;
+  bool have_store, have_chunks = false;
   int c;
 
   while ((c = getopt_long (argc, argv, "av", long_options, NULL))
@@ -352,6 +708,15 @@ main (int argc, char **argv)
         break;
       case 'c':
         use_cpu = true;
+        break;
+      case 't':
+        {
+          char *end;
+          errno = 0;
+          chunk_time = strtol (optarg, &end, 10);
+          if (errno || end == optarg || *end || chunk_time < 0)
+            error (EXIT_FAILURE, 0, "invalid chunk time: %s", optarg);
+        }
         break;
       case 'v':
         verbose = true;
@@ -406,6 +771,9 @@ main (int argc, char **argv)
   if (!model_embed (model, "warm up", &vec, &dim))
     error (EXIT_FAILURE, 0, "cannot run the %s model", EMBED_MODEL);
   free (vec);
+
+  if (have_store)
+    have_chunks = load_chunks (chunks, dim);
 
   if (have_store)
     {
@@ -471,6 +839,10 @@ main (int argc, char **argv)
               && e->size == ent->fts_statp->st_size && dim > 0)
             {
               n_same++;
+              if (e->chunk_total < 0
+                  || e->chunk_done < (size_t) e->chunk_total)
+                add_candidate (e->path, e->mtime, e->size, e,
+                               e->chunk_total, e->chunk_done);
               continue;
             }
         }
@@ -496,9 +868,12 @@ main (int argc, char **argv)
         {
           keep[e->line] = 0;
           e->line = n_lines;
+          e->changed = true;
         }
       keep_push (1);
       n_new++;
+      add_candidate (ent->fts_path, ent->fts_statp->st_mtime,
+                     ent->fts_statp->st_size, e, -1, 0);
 
       if (!verbose && isatty (STDERR_FILENO) && n_new % 10 == 0)
         fprintf (stderr, "\rembedded %zu, unchanged %zu", n_new, n_same);
@@ -506,6 +881,11 @@ main (int argc, char **argv)
   if (!verbose && isatty (STDERR_FILENO))
     fputc ('\n', stderr);
   fts_close (fts);
+  if (!interrupted && chunk_time > 0)
+    {
+      n_chunks = embed_chunks (model, magic_mime, dim, chunks, have_chunks);
+      have_chunks = true;
+    }
   model_close (model);
   close_media_models ();
   if (fclose (out) != 0)
@@ -522,9 +902,11 @@ main (int argc, char **argv)
         keep[entries[i].line] = 0;
     }
   compact_store (store);
+  if (have_chunks)
+    compact_chunks (chunks);
 
-  fprintf (stderr, "%s: embedded %zu, unchanged %zu, failed %zu%s\n",
-           store, n_new, n_same, n_failed,
+  fprintf (stderr, "%s: embedded %zu, unchanged %zu, failed %zu, "
+           "chunks %zu%s\n", store, n_new, n_same, n_failed, n_chunks,
            interrupted ? " (interrupted)" : "");
 
   magic_close (magic_mime);

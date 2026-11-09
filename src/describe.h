@@ -68,6 +68,27 @@ bool embed_file (struct model *m, magic_t magic_mime, magic_t magic_desc,
                  const char *file, const char *home, size_t dim,
                  float **vec, float **picture);
 
+/* Return how many chunks of a file of TEXT_LEN bytes of text to embed,
+   if it may have at most CAP: one for each window of text after the
+   first, which its description covers, up to CAP.  */
+size_t chunk_plan (size_t text_len, size_t cap);
+
+/* Put the whole text of FILE, of SIZE bytes, into OUT, to be split into
+   chunks, and return how many chunks to embed of it: none if it is not
+   running text, or too short to need them.  */
+size_t chunk_text (magic_t magic_mime, const char *file, long long size,
+                   struct buf *out);
+
+/* Store in *START and *END the byte range of TEXT that is the I'th
+   chunk to embed of K, from a window spread through it.  */
+void chunk_window (const struct buf *text, size_t k, size_t i,
+                   size_t *start, size_t *end);
+
+/* Embed the I'th chunk of K of TEXT, the text of FILE, into *VEC, of
+   DIM floats.  */
+bool embed_chunk (struct model *m, const char *file, const struct buf *text,
+                  size_t k, size_t i, size_t dim, float **vec);
+
 /* Close the vision and speech models, if they were opened.  */
 void close_media_models (void);
 

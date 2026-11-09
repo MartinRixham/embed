@@ -141,6 +141,8 @@ find_latest (FILE *f, size_t *n, char *const *want, char **found)
         }
       v[used].path = xstrdup (path);
       v[used].line = line_no;
+      if (sscanf (line, "%lld %lld", &v[used].mtime, &v[used].size) != 2)
+        v[used].mtime = v[used].size = -1;
       used++;
     }
   free (line);
@@ -261,19 +263,79 @@ score_record (const struct query *q, const float *vec, const float *picture,
   return best;
 }
 
+FILE *
+open_chunks (size_t dim)
+{
+  char *path = chunk_store_path (), *line = NULL, model[256];
+  size_t line_size = 0, d;
+  FILE *f = fopen (path, "r");
+
+  free (path);
+  if (f && (getline (&line, &line_size, f) <= 0
+            || !parse_header (line, model, sizeof model, &d)
+            || strcmp (model, EMBED_MODEL) != 0 || d != dim))
+    {
+      fclose (f);
+      f = NULL;
+    }
+  free (line);
+  return f;
+}
+
+/* Raise SCORES, one for each of the N_LATEST paths of LATEST, or NAN
+   for those not to be scored, to the best score against Q of each
+   path's chunks in the chunk store F.  */
+static void
+score_chunks (FILE *f, const struct latest *latest, size_t n_latest,
+              const struct query *q, size_t dim, float *scores)
+{
+  float *vec = xmalloc (dim * sizeof *vec);
+  char *line = NULL;
+  size_t line_size = 0;
+  ssize_t len;
+
+  while ((len = getline (&line, &line_size, f)) > 0)
+    {
+      long long mtime, size;
+      struct latest key;
+      const struct latest *newest;
+      char *path, *p;
+      double s;
+
+      if (!(path = split_record (line, len, &p, NULL)) || *p == '-'
+          || sscanf (line, "%lld %lld", &mtime, &size) != 2)
+        continue;
+      key.path = path;
+      newest = n_latest ? bsearch (&key, latest, n_latest, sizeof *latest,
+                                   compare_paths) : NULL;
+      if (!newest || newest->mtime != mtime || newest->size != size
+          || isnan (scores[newest - latest])
+          || !parse_q8_vector (p, vec, dim))
+        continue;
+      s = score_record (q, vec, NULL, dim);
+      if (s > scores[newest - latest])
+        scores[newest - latest] = s;
+    }
+  free (line);
+  free (vec);
+}
+
 struct match *
 search_records (FILE *f, const struct latest *latest, size_t n_latest,
                 const struct query *q, size_t dim, char *const *exclude,
-                size_t count, size_t *used)
+                FILE *chunks, size_t count, size_t *used)
 {
   struct match *matches = xmalloc (count * sizeof *matches);
   float *vec = xmalloc (dim * sizeof *vec);
   float *pvec = xmalloc (dim * sizeof *pvec);
+  float *scores = xmalloc ((n_latest + 1) * sizeof *scores);
   char *line = NULL;
   size_t line_size = 0;
   ssize_t len;
 
   *used = 0;
+  for (size_t i = 0; i < n_latest; i++)
+    scores[i] = NAN;
   for (size_t line_no = 1;
        (len = getline (&line, &line_size, f)) > 0; line_no++)
     {
@@ -294,12 +356,18 @@ search_records (FILE *f, const struct latest *latest, size_t n_latest,
         continue;
       if (picture && parse_hex_vector (picture, pvec, dim))
         pic = pvec;
-      insert_match (matches, count, used, path,
-                    score_record (q, vec, pic, dim));
+      scores[newest - latest] = score_record (q, vec, pic, dim);
     }
   free (line);
   free (vec);
   free (pvec);
+
+  if (chunks)
+    score_chunks (chunks, latest, n_latest, q, dim, scores);
+  for (size_t i = 0; i < n_latest; i++)
+    if (!isnan (scores[i]))
+      insert_match (matches, count, used, latest[i].path, scores[i]);
+  free (scores);
   return matches;
 }
 

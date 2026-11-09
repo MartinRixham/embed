@@ -7,7 +7,9 @@
    (at your option) any later version.
 
    embed-query and embed-search-provider both search the store with
-   these, so that they rank files alike.  */
+   these, so that they rank files alike.  A file scores the best of
+   its record and its chunks, the vectors of passages spread through
+   it.  */
 
 #ifndef EMBED_SEARCH_H
 #define EMBED_SEARCH_H
@@ -49,11 +51,14 @@ struct match
   char *path;
 };
 
-/* The line number of the newest record for a path.  */
+/* The line number of the newest record for a path, and the
+   modification time and size of the file it was made from.  */
 struct latest
 {
   char *path;
   size_t line;
+  long long mtime;
+  long long size;
 };
 
 /* Insert PATH with SCORE into the N best MATCHES, which hold *USED
@@ -93,15 +98,23 @@ void query_free (struct query *q);
 double score_record (const struct query *q, const float *vec,
                      const float *picture, size_t dim);
 
+/* Open the chunk store, if there is one for vectors of DIM floats
+   from the model that made the store, and return it positioned after
+   its header; otherwise return NULL.  */
+FILE *open_chunks (size_t dim);
+
 /* Score the records of F, from the current position to the end, that
    LATEST, from find_latest at the same position, says are the newest,
    leaving out those in the NULL-terminated EXCLUDE (which may be NULL).
-   Return the COUNT best matches, best first, freshly allocated, and
-   store how many there are in *USED.  */
+   A file whose chunks are in CHUNKS (which may be NULL), from
+   open_chunks, scores the best of its record and those of its chunks
+   that are of the file as it was when its record was made.  Return
+   the COUNT best matches, best first, freshly allocated, and store how
+   many there are in *USED.  */
 struct match *search_records (FILE *f, const struct latest *latest,
                               size_t n_latest, const struct query *q,
                               size_t dim, char *const *exclude,
-                              size_t count, size_t *used);
+                              FILE *chunks, size_t count, size_t *used);
 
 void free_matches (struct match *matches, size_t used);
 

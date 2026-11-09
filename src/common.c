@@ -10,6 +10,7 @@
 
 #include <errno.h>
 #include <inttypes.h>
+#include <math.h>
 #include <error.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -132,6 +133,12 @@ store_path (void)
   return data_path ("embeddings.txt");
 }
 
+char *
+chunk_store_path (void)
+{
+  return data_path ("chunks.txt");
+}
+
 bool
 parse_header (const char *line, char *model, size_t model_size,
               size_t *dim)
@@ -172,6 +179,24 @@ static const unsigned char hex_value[256] = {
   ['A'] = 11, ['B'] = 12, ['C'] = 13, ['D'] = 14, ['E'] = 15, ['F'] = 16
 };
 
+/* Decode the 8 hex digits at the start of S into *X.  */
+static bool
+parse_hex_vector_prefix (const char *s, float *x)
+{
+  const unsigned char *p = (const unsigned char *) s;
+  uint32_t u = 0;
+
+  for (int j = 0; j < 8; j++)
+    {
+      unsigned v = hex_value[p[j]];
+      if (!v)
+        return false;
+      u = u << 4 | (v - 1);
+    }
+  memcpy (x, &u, sizeof u);
+  return true;
+}
+
 bool
 parse_hex_vector (const char *s, float *vec, size_t dim)
 {
@@ -190,6 +215,47 @@ parse_hex_vector (const char *s, float *vec, size_t dim)
           u = u << 4 | (v - 1);
         }
       memcpy (&vec[i], &u, sizeof u);
+    }
+  return *p == '\n' || *p == '\0';
+}
+
+void
+write_q8_vector (FILE *f, const float *vec, size_t dim)
+{
+  float max = 0, scale;
+
+  for (size_t i = 0; i < dim; i++)
+    if (fabsf (vec[i]) > max)
+      max = fabsf (vec[i]);
+  scale = max > 0 ? max / 127 : 1;
+  write_hex_vector (f, &scale, 1);
+  for (size_t i = 0; i < dim; i++)
+    {
+      long q = lrintf (vec[i] / scale);
+      if (q > 127)
+        q = 127;
+      if (q < -127)
+        q = -127;
+      fprintf (f, "%02x", (unsigned) (q & 0xff));
+    }
+}
+
+bool
+parse_q8_vector (const char *s, float *vec, size_t dim)
+{
+  const unsigned char *p = (const unsigned char *) s + 8;
+  float scale;
+
+  if (!parse_hex_vector_prefix (s, &scale))
+    return false;
+  for (size_t i = 0; i < dim; i++, p += 2)
+    {
+      unsigned hi = hex_value[p[0]], lo;
+
+      /* A NUL is not a digit, so this never reads past the end.  */
+      if (!hi || !(lo = hex_value[p[1]]))
+        return false;
+      vec[i] = (signed char) ((hi - 1) << 4 | (lo - 1)) * scale;
     }
   return *p == '\n' || *p == '\0';
 }

@@ -655,6 +655,239 @@ START_TEST (test_extract_epub)
 }
 END_TEST
 
+/* Chunks.  */
+
+/* Return the chunk store's contents, or "" if there is none.  */
+static char *
+chunks_text (void)
+{
+  char *p = path_join (fx.home, ".local/share/embed/chunks.txt");
+  char *s = read_file (p);
+
+  free (p);
+  return s ? s : strdup ("");
+}
+
+/* Return the number of chunk lines for HOME/NAME whose I and K fields
+   are "I K", or any if WHICH is NULL.  */
+static size_t
+chunks_for (const char *name, const char *which)
+{
+  char *text = chunks_text (), *needle, *line, *save;
+  size_t n = 0;
+
+  if (asprintf (&needle, "\t%s/%s\t", fx.home, name) < 0)
+    abort ();
+  for (line = strtok_r (text, "\n", &save); line;
+       line = strtok_r (NULL, "\n", &save))
+    {
+      long long a, b;
+      char ik[64];
+      int off;
+
+      if (!strstr (line, needle)
+          || sscanf (line, "%lld %lld %n", &a, &b, &off) != 2)
+        continue;
+      snprintf (ik, sizeof ik, "%.*s", (int) strcspn (line + off, "\t"),
+                line + off);
+      if (!which || strcmp (ik, which) == 0)
+        n++;
+    }
+  free (needle);
+  free (text);
+  return n;
+}
+
+/* Return LEN bytes of words, with KEYWORD from FROM to TO and filler
+   elsewhere, freshly allocated.  */
+static char *
+words (size_t len, const char *keyword, size_t from, size_t to)
+{
+  char *s = malloc (len + 1);
+  size_t n = 0;
+
+  while (n < len)
+    {
+      const char *w = n >= from && n < to ? keyword : "lorem";
+      size_t m = strlen (w);
+
+      if (n + m + 1 > len)
+        break;
+      memcpy (s + n, w, m);
+      s[n + m] = ' ';
+      n += m + 1;
+    }
+  memset (s + n, ' ', len - n);
+  s[len] = '\0';
+  return s;
+}
+
+START_TEST (test_chunk_plan)
+{
+  ck_assert_uint_eq (chunk_plan (0, 64), 0);
+  ck_assert_uint_eq (chunk_plan (CHUNK_BYTES, 64), 0);
+  ck_assert_uint_eq (chunk_plan (CHUNK_BYTES + 1, 64), 1);
+  ck_assert_uint_eq (chunk_plan (10 * CHUNK_BYTES, 64), 9);
+  ck_assert_uint_eq (chunk_plan (1000 * CHUNK_BYTES, 64), 64);
+  ck_assert_uint_eq (chunk_plan (1000 * CHUNK_BYTES, 4), 4);
+}
+END_TEST
+
+START_TEST (test_chunk_slot_spreads_then_fills)
+{
+  static const size_t want[] = { 0, 4, 2, 1, 3 };
+  bool seen[64] = { false };
+
+  for (size_t i = 0; i < 5; i++)
+    ck_assert_uint_eq (chunk_slot (5, i), want[i]);
+  for (size_t i = 0; i < 64; i++)
+    {
+      size_t j = chunk_slot (64, i);
+      ck_assert (j < 64 && !seen[j]);
+      seen[j] = true;
+    }
+  ck_assert_uint_eq (chunk_slot (64, 1), 32);
+}
+END_TEST
+
+START_TEST (test_chunk_window_on_word_boundaries)
+{
+  struct buf b;
+  char *text = words (20 * CHUNK_BYTES, "ab", 0, 0);
+  size_t k = chunk_plan (strlen (text), 4);
+
+  buf_init (&b);
+  buf_puts (&b, text);
+  for (size_t i = 0; i < k; i++)
+    {
+      size_t start, end;
+
+      chunk_window (&b, k, i, &start, &end);
+      ck_assert_uint_ge (start, CHUNK_BYTES);
+      ck_assert_uint_le (end, b.len);
+      ck_assert_uint_gt (end - start, CHUNK_BYTES / 2);
+      ck_assert_uint_le (end - start, CHUNK_BYTES + 200);
+      ck_assert (b.data[start - 1] == ' ');
+    }
+  buf_free (&b);
+  free (text);
+}
+END_TEST
+
+START_TEST (test_index_chunks_long_file)
+{
+  char *text = words (20 * CHUNK_BYTES, "sonata", 15 * CHUNK_BYTES,
+                      16 * CHUNK_BYTES);
+  char *log;
+
+  put ("long.txt", text);
+  put ("short.txt", "A sourdough rye.");
+  ck_assert_int_eq (run_index (NULL), 0);
+
+  /* Every window after the first, as it is a document.  */
+  ck_assert_uint_eq (chunks_for ("long.txt", NULL), 19);
+  ck_assert_uint_eq (chunks_for ("long.txt", "0 19"), 1);
+  ck_assert_uint_eq (chunks_for ("long.txt", "18 19"), 1);
+  ck_assert_uint_eq (chunks_for ("short.txt", "0 0"), 1);
+  log = read_file (fx.log);
+  ck_assert_ptr_nonnull (strstr (log, "From the file long.txt:\n\nsonata"));
+  ck_assert_ptr_nonnull (strstr (err_text (), "chunks 19"));
+
+  /* Nothing more to do.  */
+  unlink (fx.log);
+  ck_assert_int_eq (run_index (NULL), 0);
+  ck_assert_uint_eq (requests (), 1);   /* Only the warm-up.  */
+  ck_assert_uint_eq (chunks_for ("long.txt", NULL), 19);
+  ck_assert_uint_eq (chunks_for ("short.txt", NULL), 1);
+  free (text);
+}
+END_TEST
+
+START_TEST (test_index_chunks_code_fewer)
+{
+  char *text = words (20 * CHUNK_BYTES, "x", 0, 0);
+
+  memcpy (text, "#include <stdio.h>\nint main (void) {", 36);
+  put ("prog.c", text);
+  ck_assert_int_eq (run_index (NULL), 0);
+  ck_assert_uint_eq (chunks_for ("prog.c", NULL), CHUNKS_OTHER);
+  free (text);
+}
+END_TEST
+
+START_TEST (test_index_chunks_carry_on_next_run)
+{
+  /* Each embedding takes 3 seconds, and a run may spend 1 on chunks,
+     so each run embeds just one.  */
+  char *text = words (3 * CHUNK_BYTES, "FAKE_SLOW", 0, 3 * CHUNK_BYTES);
+
+  put ("slow.txt", text);
+  ck_assert_int_eq (run_index ("--chunk-time=1", NULL), 0);
+  ck_assert_uint_eq (chunks_for ("slow.txt", NULL), 1);
+  ck_assert_uint_eq (chunks_for ("slow.txt", "0 2"), 1);
+  ck_assert_int_eq (run_index ("--chunk-time=1", NULL), 0);
+  ck_assert_uint_eq (chunks_for ("slow.txt", NULL), 2);
+  ck_assert_uint_eq (chunks_for ("slow.txt", "1 2"), 1);
+  unlink (fx.log);
+  ck_assert_int_eq (run_index ("--chunk-time=1", NULL), 0);
+  ck_assert_uint_eq (requests (), 1);   /* Only the warm-up.  */
+  free (text);
+}
+END_TEST
+
+START_TEST (test_index_chunks_redone_when_file_changes)
+{
+  char *text = words (5 * CHUNK_BYTES, "alpha", 0, 0);
+
+  put ("doc.txt", text);
+  ck_assert_int_eq (run_index (NULL), 0);
+  ck_assert_uint_eq (chunks_for ("doc.txt", NULL), 4);
+  free (text);
+
+  text = words (3 * CHUNK_BYTES, "omega", 0, 0);
+  put ("doc.txt", text);
+  touch_by ("doc.txt", 10);
+  ck_assert_int_eq (run_index (NULL), 0);
+  ck_assert_uint_eq (chunks_for ("doc.txt", NULL), 2);
+  ck_assert_uint_eq (chunks_for ("doc.txt", "0 2"), 1);
+
+  /* And dropped when it goes.  */
+  unlink (home_file ("doc.txt"));
+  ck_assert_int_eq (run_index (NULL), 0);
+  ck_assert_uint_eq (chunks_for ("doc.txt", NULL), 0);
+  free (text);
+}
+END_TEST
+
+START_TEST (test_index_chunk_time_zero)
+{
+  char *text = words (5 * CHUNK_BYTES, "alpha", 0, 0);
+
+  put ("doc.txt", text);
+  ck_assert_int_eq (run_index ("--chunk-time=0", NULL), 0);
+  ck_assert_uint_eq (chunks_for ("doc.txt", NULL), 0);
+  ck_assert_int_eq (run_index ("--chunk-time=x", NULL), EXIT_FAILURE);
+  free (text);
+}
+END_TEST
+
+START_TEST (test_index_chunks_dropped_on_model_change)
+{
+  char *text = words (5 * CHUNK_BYTES, "alpha", 0, 0);
+  char *p = path_join (fx.home, ".local/share/embed/chunks.txt");
+
+  put ("doc.txt", text);
+  write_file (p, "# embed-index chunks model=other dim=8\n"
+              "1 1 0 1\t/gone\t-\n", (size_t) -1);
+  ck_assert_int_eq (run_index (NULL), 0);
+  ck_assert_ptr_null (strstr (chunks_text (), "/gone"));
+  ck_assert_ptr_nonnull (strstr (chunks_text (), "model=" EMBED_MODEL));
+  ck_assert_uint_eq (chunks_for ("doc.txt", NULL), 4);
+  free (p);
+  free (text);
+}
+END_TEST
+
 /* Describing files.  */
 
 static magic_t mime_cookie, desc_cookie;
@@ -1216,7 +1449,7 @@ START_TEST (test_index_long_file_is_cut)
   memset (big, 'w', 100000);
   big[100000] = '\0';
   put ("big.txt", big);
-  ck_assert_int_eq (run_index (NULL), 0);
+  ck_assert_int_eq (run_index ("--chunk-time=0", NULL), 0);
   log = read_file (fx.log);
   ck_assert_uint_lt (strlen (log), MAX_CONTENT + 1000);
   ck_assert_uint_eq (records_for ("big.txt"), 1);
@@ -2134,6 +2367,15 @@ index_suite (void)
   tcase_add_test (tc, test_index_unembeddable_file);
   tcase_add_test (tc, test_index_quiet_unless_verbose);
   tcase_add_test (tc, test_index_long_file_is_cut);
+  tcase_add_test (tc, test_chunk_plan);
+  tcase_add_test (tc, test_chunk_slot_spreads_then_fills);
+  tcase_add_test (tc, test_chunk_window_on_word_boundaries);
+  tcase_add_test (tc, test_index_chunks_long_file);
+  tcase_add_test (tc, test_index_chunks_code_fewer);
+  tcase_add_test (tc, test_index_chunks_carry_on_next_run);
+  tcase_add_test (tc, test_index_chunks_redone_when_file_changes);
+  tcase_add_test (tc, test_index_chunk_time_zero);
+  tcase_add_test (tc, test_index_chunks_dropped_on_model_change);
   tcase_add_test (tc, test_index_binary_content_is_safe);
   tcase_add_test (tc, test_index_model_change);
   tcase_add_test (tc, test_index_model_option_removed);
