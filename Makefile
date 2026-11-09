@@ -13,6 +13,7 @@ prefix ?= /usr/local
 bindir ?= $(prefix)/bin
 datadir ?= $(prefix)/share
 searchproviderdir ?= $(datadir)/gnome-shell/search-providers
+userunitdir ?= $(prefix)/lib/systemd/user
 GIO_CFLAGS = $(shell pkg-config --cflags gio-2.0)
 GIO_LIBS = $(shell pkg-config --libs gio-2.0)
 
@@ -51,10 +52,12 @@ whisper.o: ov-embed.h
 
 SUBST = sed 's|@bindir@|$(bindir)|g'
 
-# GNOME Shell picks the search provider up when you next log in.
+# GNOME Shell picks the search provider up, and each user's session
+# starts indexing every hour, when they next log in.
 install: all
 	install -d $(DESTDIR)$(bindir) $(DESTDIR)$(datadir)/applications \
-	  $(DESTDIR)$(datadir)/dbus-1/services $(DESTDIR)$(searchproviderdir)
+	  $(DESTDIR)$(datadir)/dbus-1/services $(DESTDIR)$(searchproviderdir) \
+	  $(DESTDIR)$(userunitdir)
 	install -m 755 $(PROGRAMS) $(DESTDIR)$(bindir)
 	$(SUBST) data/embed-search.desktop.in \
 	  > $(DESTDIR)$(datadir)/applications/embed-search.desktop
@@ -62,6 +65,12 @@ install: all
 	  > $(DESTDIR)$(datadir)/dbus-1/services/embed.SearchProvider.service
 	install -m 644 data/embed-search-provider.ini \
 	  $(DESTDIR)$(searchproviderdir)/embed-search-provider.ini
+	$(SUBST) data/embed-index.service.in \
+	  > $(DESTDIR)$(userunitdir)/embed-index.service
+	install -m 644 data/embed-index.timer $(DESTDIR)$(userunitdir)
+	if [ -z "$(DESTDIR)" ]; then \
+	  systemctl --global enable embed-index.timer; \
+	fi
 
 # A tool for checking the tokenizer by hand.
 tools/tokenize: tools/tokenize.c tokenizer.c common.c tokenizer.h common.h

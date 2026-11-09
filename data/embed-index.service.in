@@ -1,0 +1,25 @@
+[Unit]
+Description=Embed new and changed files for search
+# Not for system accounts such as the display manager's, which have no
+# files worth searching.
+ConditionUser=!@system
+# Leave the battery alone: the timer tries again later.
+ConditionACPower=true
+
+[Service]
+Type=oneshot
+ExecStart=@bindir@/embed-index
+# An interrupted run (130) keeps what it has embedded, and the next
+# one carries on; and if another run, perhaps started by hand, holds
+# the lock (75), this one leaves the work to it.  Neither is a failure.
+SuccessExitStatus=130 75
+TimeoutStopSec=60
+
+# Use only what nothing else wants.
+Nice=19
+CPUSchedulingPolicy=idle
+IOSchedulingClass=idle
+CPUWeight=idle
+IOWeight=1
+# Squeeze its memory, rather than anyone else's, when it grows large.
+MemoryHigh=4G

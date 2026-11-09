@@ -982,6 +982,27 @@ START_TEST (test_index_rerun_skips_unchanged)
 }
 END_TEST
 
+START_TEST (test_index_refuses_concurrent_run)
+{
+  char *lock = home_file (".local/share/embed/index.lock");
+  int fd;
+
+  put ("a.txt", "alpha");
+  make_parent_dirs (lock);
+  fd = open (lock, O_RDWR | O_CREAT, 0644);
+  ck_assert_int_ge (fd, 0);
+  ck_assert_int_eq (flock (fd, LOCK_EX), 0);
+  ck_assert_int_eq (run_index (NULL), EXIT_LOCKED);
+  ck_assert_ptr_nonnull (strstr (err_text (), "already running"));
+  ck_assert_int_eq (access (fx.store, F_OK), -1);
+
+  close (fd);
+  ck_assert_int_eq (run_index (NULL), 0);
+  ck_assert_ptr_nonnull (strstr (err_text (), "embedded 1"));
+  free (lock);
+}
+END_TEST
+
 START_TEST (test_index_modified_file)
 {
   char *store;
@@ -2062,6 +2083,7 @@ index_suite (void)
   tcase_add_test (tc, test_index_vectors_are_unit_length);
   tcase_add_test (tc, test_index_hidden_with_all);
   tcase_add_test (tc, test_index_rerun_skips_unchanged);
+  tcase_add_test (tc, test_index_refuses_concurrent_run);
   tcase_add_test (tc, test_index_modified_file);
   tcase_add_test (tc, test_index_same_mtime_new_size);
   tcase_add_test (tc, test_index_deleted_file);

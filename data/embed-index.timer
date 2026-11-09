@@ -1,0 +1,13 @@
+[Unit]
+Description=Embed new and changed files for search every hour
+
+[Timer]
+# A while after logging in, so as not to slow the start of the session,
+# and then hourly.  A run that is still going when the next is due is
+# left to finish.
+OnStartupSec=15min
+OnCalendar=hourly
+RandomizedDelaySec=10min
+
+[Install]
+WantedBy=timers.target

@@ -24,7 +24,10 @@
    version of the record format is always 1 for now; it is written
    but not yet read.
    Files whose size and modification time are unchanged since the last
-   run are skipped, so the program can be rerun cheaply.  */
+   run are skipped, so the program can be rerun cheaply.  Only one run
+   at a time may work on the store, since each rewrites it at the end
+   without what another has added meanwhile, so a run takes a lock on
+   ~/.local/share/embed/index.lock and gives up if another holds it.  */
 
 #include "common.h"
 #include "describe.h"
@@ -32,11 +35,13 @@
 
 #include <errno.h>
 #include <error.h>
+#include <fcntl.h>
 #include <fts.h>
 #include <getopt.h>
 #include <magic.h>
 #include <signal.h>
 #include <stdio.h>
+#include <sys/file.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -294,6 +299,31 @@ compact_store (const char *path)
   buf_free (&tmp_path);
 }
 
+/* The exit status when another run holds the lock, so that a timer can
+   tell it from a failure: EX_TEMPFAIL.  */
+#define EXIT_LOCKED 75
+
+/* Lock the store against other runs, for as long as the program
+   runs.  Exit if another run holds the lock.  */
+static void
+lock_store (void)
+{
+  char *path = data_path ("index.lock");
+  int fd;
+
+  make_parent_dirs (path);
+  fd = open (path, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+  if (fd < 0)
+    error (EXIT_FAILURE, errno, "%s", path);
+  if (flock (fd, LOCK_EX | LOCK_NB) != 0)
+    {
+      if (errno == EWOULDBLOCK)
+        error (EXIT_LOCKED, 0, "another embed-index is already running");
+      error (EXIT_FAILURE, errno, "%s", path);
+    }
+  free (path);
+}
+
 int
 main (int argc, char **argv)
 {
@@ -350,6 +380,7 @@ main (int argc, char **argv)
       roots = default_roots;
     }
 
+  lock_store ();
   store_dir = xstrdup (store);
   *strrchr (store_dir, '/') = '\0';
 
