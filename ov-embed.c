@@ -9,8 +9,9 @@
    OpenVINO's GPU plugin cannot compile this model with inputs of
    varying length, so it is compiled for a few fixed lengths, each the
    first time a text needs it, and shorter texts are padded with
-   [PAD] tokens that the attention mask hides.  An image model takes
-   images of one fixed size, so it is compiled just once.  */
+   [PAD] tokens that the attention mask hides.  Other models, such as
+   those for images, take inputs of one fixed shape, so are compiled
+   just once.  */
 
 #include "ov-embed.h"
 #include "common.h"
@@ -31,7 +32,10 @@ struct ov_embed
   ov_core_t *core;
   ov_model_t *model;
   char *cache_dir;
-  size_t image_side;            /* For an image model; 0 for text.  */
+  /* The one input shape of a fixed-shape model; RANK is 0 for a text
+     model.  */
+  size_t rank;
+  int64_t dims[OV_MAX_RANK];
   size_t n_inputs;
   char *input_names[MAX_INPUTS];
   /* One compiled model and request for each of LENGTHS, or NULL.  */
@@ -80,21 +84,20 @@ unit_length (float *v, size_t dim)
       v[d] /= norm;
 }
 
-/* Compile the model for input length LENGTHS[I], if not yet done.  An
-   image model has just the one shape, as I = 0.  */
+/* Compile the model for input length LENGTHS[I], if not yet done.  A
+   fixed-shape model has just the one shape, as I = 0.  */
 static bool
 compile_length (struct ov_embed *m, size_t i)
 {
   ov_partial_shape_t shapes[MAX_INPUTS];
-  int64_t side = m->image_side;
   int64_t text_dims[2] = { 1, (int64_t) lengths[i] };
-  int64_t image_dims[4] = { 1, 3, side, side };
   bool ok;
 
   if (m->request[i])
     return true;
   for (size_t j = 0; j < m->n_inputs; j++)
-    if ((side ? ov_partial_shape_create_static (4, image_dims, &shapes[j])
+    if ((m->rank
+         ? ov_partial_shape_create_static (m->rank, m->dims, &shapes[j])
          : ov_partial_shape_create_static (2, text_dims, &shapes[j])) != OK)
       return false;
   ok = !failed (ov_model_reshape (m->model, (const char **) m->input_names,
@@ -110,17 +113,19 @@ compile_length (struct ov_embed *m, size_t i)
   return ok;
 }
 
-/* Load the model in PATH, as an image model of SIDE pixels square if
-   SIDE is not 0, and as a text model otherwise.  */
+/* Load the model in PATH, as a model of one input of the RANK
+   dimensions DIMS if RANK is not 0, and as a text model otherwise.  */
 static struct ov_embed *
-load (const char *path, const char *cache_dir, size_t side,
-      const char **why)
+load (const char *path, const char *cache_dir, size_t rank,
+      const int64_t *dims, const char **why)
 {
   struct ov_embed *m = xmalloc (sizeof *m);
 
   memset (m, 0, sizeof *m);
   m->cache_dir = xstrdup (cache_dir);
-  m->image_side = side;
+  m->rank = rank;
+  for (size_t i = 0; i < rank; i++)
+    m->dims[i] = dims[i];
   *why = "OpenVINO cannot start";
   if (ov_core_create (&m->core) != OK)
     goto fail;
@@ -130,7 +135,7 @@ load (const char *path, const char *cache_dir, size_t side,
   *why = "OpenVINO cannot load the model";
   if (failed (ov_core_read_model (m->core, path, NULL, &m->model), path)
       || failed (ov_model_inputs_size (m->model, &m->n_inputs), path)
-      || m->n_inputs > MAX_INPUTS || (side && m->n_inputs != 1))
+      || m->n_inputs > MAX_INPUTS || (rank && m->n_inputs != 1))
     goto fail;
   for (size_t i = 0; i < m->n_inputs; i++)
     {
@@ -162,14 +167,28 @@ load (const char *path, const char *cache_dir, size_t side,
 struct ov_embed *
 ov_embed_load (const char *path, const char *cache_dir, const char **why)
 {
-  return load (path, cache_dir, 0, why);
+  return load (path, cache_dir, 0, NULL, why);
 }
 
 struct ov_embed *
 ov_embed_load_image (const char *path, const char *cache_dir, size_t side,
                      const char **why)
 {
-  return load (path, cache_dir, side, why);
+  int64_t dims[4] = { 1, 3, (int64_t) side, (int64_t) side };
+
+  return load (path, cache_dir, 4, dims, why);
+}
+
+struct ov_embed *
+ov_embed_load_fixed (const char *path, const char *cache_dir, size_t rank,
+                     const int64_t *dims, const char **why)
+{
+  if (rank < 1 || rank > OV_MAX_RANK)
+    {
+      *why = "bad input shape";
+      return NULL;
+    }
+  return load (path, cache_dir, rank, dims, why);
 }
 
 void
@@ -206,7 +225,7 @@ ov_embed (struct ov_embed *m, const int64_t *ids, size_t n, float **vec,
   float *hidden, *v;
   bool ok = false;
 
-  if (m->image_side || n == 0 || n > OV_EMBED_MAX)
+  if (m->rank || n == 0 || n > OV_EMBED_MAX)
     return false;
   while (lengths[which] < n)
     which++;
@@ -279,54 +298,78 @@ ov_embed (struct ov_embed *m, const int64_t *ids, size_t n, float **vec,
 }
 
 bool
-ov_embed_image (struct ov_embed *m, const float *pixels, float **vec,
-                size_t *dim)
+ov_run_fixed (struct ov_embed *m, const float *in, float **out,
+              int64_t *out_dims, size_t *out_rank)
 {
-  int64_t side = m->image_side;
-  int64_t dims[4] = { 1, 3, side, side };
-  ov_tensor_t *tensor = NULL, *out = NULL;
+  ov_tensor_t *tensor = NULL, *result = NULL;
   ov_shape_t shape = { 0 }, out_shape = { 0 };
   ov_element_type_e type;
-  float *hidden, *v;
+  size_t count = 1;
+  float *data;
   bool ok = false;
 
-  if (!side || failed (ov_shape_create (4, dims, &shape), "shape"))
+  if (!m->rank || failed (ov_shape_create (m->rank, m->dims, &shape),
+                          "shape"))
     return false;
-  if (failed (ov_tensor_create_from_host_ptr (F32, shape, (void *) pixels,
+  if (failed (ov_tensor_create_from_host_ptr (F32, shape, (void *) in,
                                               &tensor), "tensor")
       || failed (ov_infer_request_set_tensor (m->request[0],
                                               m->input_names[0], tensor),
                  m->input_names[0])
       || failed (ov_infer_request_infer (m->request[0]), "infer")
       || failed (ov_infer_request_get_output_tensor_by_index
-                 (m->request[0], 0, &out), "output")
-      || failed (ov_tensor_get_shape (out, &out_shape), "output shape"))
+                 (m->request[0], 0, &result), "output")
+      || failed (ov_tensor_get_shape (result, &out_shape), "output shape"))
     goto out;
-  if (failed (ov_tensor_get_element_type (out, &type), "output type")
-      || type != F32 || out_shape.rank != 3 || out_shape.dims[0] != 1
-      || out_shape.dims[1] <= 0 || out_shape.dims[2] <= 0)
+  if (failed (ov_tensor_get_element_type (result, &type), "output type")
+      || type != F32 || out_shape.rank < 1 || out_shape.rank > OV_MAX_RANK)
     {
       error (0, 0, "OpenVINO: unexpected output type or shape");
       goto out;
     }
-  if (failed (ov_tensor_data (out, (void **) &hidden), "output data"))
+  for (int64_t i = 0; i < out_shape.rank; i++)
+    {
+      out_dims[i] = out_shape.dims[i];
+      count *= out_shape.dims[i];
+    }
+  *out_rank = out_shape.rank;
+  if (failed (ov_tensor_data (result, (void **) &data), "output data"))
     goto out;
-
-  /* The first token's state, at unit length.  */
-  *dim = out_shape.dims[2];
-  v = xmalloc (*dim * sizeof *v);
-  memcpy (v, hidden, *dim * sizeof *v);
-  unit_length (v, *dim);
-  *vec = v;
+  *out = xmalloc (count * sizeof **out);
+  memcpy (*out, data, count * sizeof **out);
   ok = true;
 
  out:
   if (out_shape.dims)
     ov_shape_free (&out_shape);
-  if (out)
-    ov_tensor_free (out);
+  if (result)
+    ov_tensor_free (result);
   if (tensor)
     ov_tensor_free (tensor);
   ov_shape_free (&shape);
   return ok;
+}
+
+bool
+ov_embed_image (struct ov_embed *m, const float *pixels, float **vec,
+                size_t *dim)
+{
+  int64_t dims[OV_MAX_RANK];
+  size_t rank;
+  float *hidden;
+
+  if (!ov_run_fixed (m, pixels, &hidden, dims, &rank))
+    return false;
+  if (rank != 3 || dims[0] != 1 || dims[1] <= 0 || dims[2] <= 0)
+    {
+      error (0, 0, "OpenVINO: unexpected output shape");
+      free (hidden);
+      return false;
+    }
+
+  /* The first token's state, at unit length.  */
+  *dim = dims[2];
+  *vec = xrealloc (hidden, *dim * sizeof *hidden);
+  unit_length (*vec, *dim);
+  return true;
 }

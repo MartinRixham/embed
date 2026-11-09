@@ -8,8 +8,9 @@
 
    These need the model's files in ~/.local/share/embed/models, where
    embed-index downloads them, and are skipped without them; they never
-   download anything.  The image model's tests are skipped in the same
-   way if just that model is missing.  The GPU tests are skipped if OpenVINO finds no
+   download anything.  The image and speech models' tests are skipped in
+   the same way if just that model is missing.  The speech test needs
+   espeak-ng and ffmpeg to make speech to transcribe.  The GPU tests are skipped if OpenVINO finds no
    GPU.  Only a few texts are embedded, to keep the machine usable.  */
 
 #include "../model.c"
@@ -22,6 +23,7 @@
 
 static char *real_models;       /* The model directory, if present.  */
 static char *real_vision;       /* The image model's, if present.  */
+static char *real_speech;       /* The speech model's, if present.  */
 static char *home;
 
 static void
@@ -37,6 +39,9 @@ setup (void)
   link = path_join (home, ".local/share/embed/models/"
                     "nomic-embed-vision-v1.5");
   ck_assert_int_eq (symlink (real_vision, link), 0);
+  free (link);
+  link = path_join (home, ".local/share/embed/models/whisper-base");
+  ck_assert_int_eq (symlink (real_speech, link), 0);
   free (link);
   setenv ("HOME", home, 1);
 }
@@ -318,6 +323,122 @@ START_TEST (test_gpu_pictures_agree_with_cpu)
 }
 END_TEST
 
+static bool
+have_speech (void)
+{
+  for (size_t i = 0; i < speech_source.n_files; i++)
+    {
+      char *p = path_join (real_speech, speech_files[i].local);
+      bool ok = access (p, R_OK) == 0;
+
+      if (!ok)
+        fprintf (stderr, "%s is missing; speech model test skipped\n", p);
+      free (p);
+      if (!ok)
+        return false;
+    }
+  return true;
+}
+
+/* Transcribe the N samples of PCM, returning the text.  */
+static char *
+hear (struct speech *s, const float *pcm, size_t n)
+{
+  struct buf b;
+
+  buf_init (&b);
+  ck_assert (speech_transcribe (s, pcm, n, &b));
+  return b.data ? b.data : xstrdup ("");
+}
+
+/* Speak a sentence about penguins into PCM, and return the number of
+   samples, or 0 if espeak-ng or ffmpeg is missing.  */
+static size_t
+speak (float *pcm)
+{
+  char *wav = path_join (home, "s.wav"), *raw = path_join (home, "s.f32");
+  char *cmd;
+  size_t n;
+  FILE *f;
+
+  if (!have_program ("espeak-ng") || !have_program ("ffmpeg"))
+    {
+      fprintf (stderr, "no espeak-ng or ffmpeg; speech test skipped\n");
+      return 0;
+    }
+  if (asprintf (&cmd, "espeak-ng -w '%s' 'The emperor penguin is the "
+                "tallest and heaviest of all living penguin species. It "
+                "breeds during the Antarctic winter.' && ffmpeg -v quiet -i '%s' "
+                "-ac 1 -ar %d -f f32le '%s' </dev/null", wav, wav,
+                SPEECH_RATE, raw) < 0)
+    abort ();
+  ck_assert_int_eq (system (cmd), 0);
+  f = fopen (raw, "rb");
+  n = fread (pcm, sizeof *pcm, SPEECH_SAMPLES, f);
+  fclose (f);
+  free (cmd);
+  free (wav);
+  free (raw);
+  return n;
+}
+
+START_TEST (test_speech)
+{
+  float *pcm = xmalloc (SPEECH_SAMPLES * sizeof *pcm);
+  char *text;
+  struct speech *s;
+  size_t n;
+
+  if (!have_speech ())
+    return;
+  s = speech_open (false);
+  ck_assert_ptr_nonnull (s);
+
+  /* Silence, and noise, say nothing.  */
+  memset (pcm, 0, SPEECH_SAMPLES * sizeof *pcm);
+  ck_assert_str_eq (hear (s, pcm, SPEECH_SAMPLES), "");
+  ck_assert_str_eq (hear (s, pcm, 0), "");
+  srand (1);
+  for (size_t i = 0; i < 10 * SPEECH_RATE; i++)
+    pcm[i] = 0.05 * (2.0 * rand () / RAND_MAX - 1);
+  ck_assert_str_eq (hear (s, pcm, 10 * SPEECH_RATE), "");
+
+  if ((n = speak (pcm)) > 0)
+    {
+      text = hear (s, pcm, n);
+      ck_assert_msg (strcasestr (text, "penguin")
+                     && strcasestr (text, "winter"), "heard: %s", text);
+    }
+  ck_assert_str_eq (whisper_device (s->whisper), "CPU");
+  speech_close (s);
+  free (pcm);
+}
+END_TEST
+
+/* The encoder on the GPU hears the same as on the CPU.  */
+START_TEST (test_speech_gpu_agrees_with_cpu)
+{
+  float *pcm = xmalloc (SPEECH_SAMPLES * sizeof *pcm);
+  struct speech *gpu, *cpu;
+  size_t n;
+
+  if (!have_gpu () || !have_speech () || !(n = speak (pcm)))
+    {
+      fprintf (stderr, "test_speech_gpu_agrees_with_cpu: skipped\n");
+      return;
+    }
+  gpu = speech_open (true);
+  cpu = speech_open (false);
+  ck_assert_ptr_nonnull (gpu);
+  ck_assert_ptr_nonnull (cpu);
+  ck_assert_str_eq (whisper_device (gpu->whisper), "GPU");
+  ck_assert_str_eq (hear (gpu, pcm, n), hear (cpu, pcm, n));
+  speech_close (gpu);
+  speech_close (cpu);
+  free (pcm);
+}
+END_TEST
+
 int
 main (void)
 {
@@ -331,7 +452,9 @@ main (void)
       || asprintf (&real_models, "%s/.local/share/embed/models/"
                    "nomic-embed-text-v1.5", real_home) < 0
       || asprintf (&real_vision, "%s/.local/share/embed/models/"
-                   "nomic-embed-vision-v1.5", real_home) < 0)
+                   "nomic-embed-vision-v1.5", real_home) < 0
+      || asprintf (&real_speech, "%s/.local/share/embed/models/"
+                   "whisper-base", real_home) < 0)
     return EXIT_FAILURE;
   for (size_t i = 0; i < text_source.n_files; i++)
     {
@@ -362,6 +485,8 @@ main (void)
   tcase_add_test (tc, test_cpu_bad_model);
   tcase_add_test (tc, test_cpu_pictures);
   tcase_add_test (tc, test_gpu_pictures_agree_with_cpu);
+  tcase_add_test (tc, test_speech);
+  tcase_add_test (tc, test_speech_gpu_agrees_with_cpu);
   suite_add_tcase (s, tc);
   sr = srunner_create (s);
   srunner_run_all (sr, CK_NORMAL);

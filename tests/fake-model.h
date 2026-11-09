@@ -23,7 +23,12 @@
    vision_open fails if the environment variable FAKE_VISION is "fail".
    vision_embed returns, normalized, 0.05 plus the mean of the red,
    green and blue channels (from 0 to 1) in dimensions 0, 1 and 2, and
-   0.05 in the others.  It logs nothing.  */
+   0.05 in the others.  It logs nothing.
+
+   speech_open fails if FAKE_SPEECH is "fail".  speech_transcribe
+   appends " sonata" if the sound's mean square is above 0.001 (a tone
+   of amplitude above about 0.045), and nothing otherwise, and logs
+   "SPEECH N" with the number of samples.  */
 
 #ifndef FAKE_MODEL_H
 #define FAKE_MODEL_H

@@ -22,6 +22,10 @@
    the same space.  */
 #define VISION_MODEL "nomic-embed-vision-v1.5"
 
+/* The model that transcribes speech, so that it can be embedded as
+   text.  */
+#define SPEECH_MODEL "whisper-base"
+
 /* Prefixes that tell the model whether it is looking at a document or
    a search query.  */
 #define DOCUMENT_PREFIX "search_document: "

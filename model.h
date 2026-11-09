@@ -1,4 +1,4 @@
-/* model.h -- the embedding models, nomic-embed-text and -vision v1.5.
+/* model.h -- the models: nomic-embed-text and -vision v1.5, and Whisper.
    Copyright (C) 2026 Martin Rixham
 
    This program is free software: you can redistribute it and/or modify
@@ -49,5 +49,25 @@ void vision_close (struct vision *v);
    model_embed.  */
 bool vision_embed (struct vision *v, const unsigned char *rgb, float **vec,
                    size_t *dim);
+
+/* The speech model, which transcribes what is said, for the text
+   model to embed.  */
+struct speech;
+struct buf;
+
+/* It takes up to this many samples at a time, of mono sound at this
+   rate, from -1 to 1.  */
+#define SPEECH_RATE 16000
+#define SPEECH_SAMPLES (30 * SPEECH_RATE)
+
+/* Open the speech model like model_open.  */
+struct speech *speech_open (bool use_gpu);
+void speech_close (struct speech *s);
+
+/* Transcribe the N samples of PCM, at most SPEECH_SAMPLES, appending
+   the text to OUT; append nothing if there is no speech.  Return false
+   if the model fails.  */
+bool speech_transcribe (struct speech *s, const float *pcm, size_t n,
+                        struct buf *out);
 
 #endif /* EMBED_MODEL_H */

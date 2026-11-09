@@ -11,7 +11,8 @@ prefix ?= $(HOME)/.local
 bindir ?= $(prefix)/bin
 
 PROGRAMS = embed-index embed-query
-MODEL_OBJS = model.o fetch.o tokenizer.o onnx-embed.o ov-embed.o
+MODEL_OBJS = model.o fetch.o tokenizer.o onnx-embed.o ov-embed.o \
+  whisper.o
 
 all: $(PROGRAMS)
 
@@ -22,12 +23,14 @@ embed-query: embed-query.o common.o $(MODEL_OBJS)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS_MODEL)
 
 common.o embed-index.o embed-query.o fetch.o model.o onnx-embed.o \
-  ov-embed.o tokenizer.o: common.h
+  ov-embed.o tokenizer.o whisper.o: common.h
 embed-index.o embed-query.o model.o: model.h
 model.o fetch.o: fetch.h
 model.o onnx-embed.o: onnx-embed.h
 model.o ov-embed.o: ov-embed.h
 model.o tokenizer.o: tokenizer.h
+model.o whisper.o: whisper.h
+whisper.o: ov-embed.h
 
 install: all
 	install -d $(DESTDIR)$(bindir)
@@ -53,7 +56,7 @@ TEST_CPPFLAGS = $(CPPFLAGS) -I. \
   -DEMBED_INDEX='"$(abspath $(TEST_BUILD)/embed-index)"' \
   -DTEST_DATA='"$(abspath $(TEST_DIR)/data)"'
 TEST_LIBS = $(shell pkg-config --libs check) $(LDLIBS_MODEL)
-TESTS = test-common test-tokenizer test-fetch test-index \
+TESTS = test-common test-tokenizer test-whisper test-fetch test-index \
   test-query test-model
 TEST_PROGRAMS = $(addprefix $(TEST_BUILD)/,$(TESTS))
 TEST_SUPPORT = $(TEST_BUILD)/testutil.o $(TEST_BUILD)/fake-http.o
@@ -71,6 +74,10 @@ $(TEST_BUILD)/embed-index: $(TEST_BUILD)/src-embed-index.o \
 	$(CC) $(TEST_CFLAGS) -o $@ $^ -lmagic -lm
 
 $(TEST_BUILD)/test-common: $(TEST_BUILD)/test-common.o $(TEST_SUPPORT)
+	$(CC) $(TEST_CFLAGS) -o $@ $^ $(TEST_LIBS)
+
+$(TEST_BUILD)/test-whisper: $(TEST_BUILD)/test-whisper.o \
+  $(TEST_BUILD)/src-common.o $(TEST_BUILD)/src-ov-embed.o $(TEST_SUPPORT)
 	$(CC) $(TEST_CFLAGS) -o $@ $^ $(TEST_LIBS)
 
 $(TEST_BUILD)/test-tokenizer: $(TEST_BUILD)/test-tokenizer.o \
@@ -102,13 +109,14 @@ $(TEST_BUILD)/plain-test-%.o: $(TEST_DIR)/%.c $(TEST_HEADERS) | $(TEST_BUILD)
 
 $(TEST_BUILD)/test-model: $(TEST_BUILD)/plain-test-test-model.o \
   $(addprefix $(TEST_BUILD)/plain-,common.o fetch.o tokenizer.o \
-  onnx-embed.o ov-embed.o) $(TEST_BUILD)/plain-test-testutil.o \
+  onnx-embed.o ov-embed.o whisper.o) $(TEST_BUILD)/plain-test-testutil.o \
   $(TEST_BUILD)/plain-test-fake-http.o
 	$(CC) $(PLAIN_CFLAGS) -o $@ $^ $(TEST_LIBS)
 
 # Each test depends on the source file it includes.
 $(TEST_BUILD)/test-common.o: common.c
 $(TEST_BUILD)/test-tokenizer.o: tokenizer.c
+$(TEST_BUILD)/test-whisper.o: whisper.c
 $(TEST_BUILD)/test-fetch.o: fetch.c
 $(TEST_BUILD)/test-index.o: embed-index.c
 $(TEST_BUILD)/test-query.o: embed-query.c

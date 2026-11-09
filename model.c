@@ -1,4 +1,4 @@
-/* model.c -- the embedding models, nomic-embed-text and -vision v1.5.
+/* model.c -- the models: nomic-embed-text and -vision v1.5, and Whisper.
    Copyright (C) 2026 Martin Rixham
 
    This program is free software: you can redistribute it and/or modify
@@ -10,7 +10,9 @@
    on Hugging Face and checked by its SHA-256 hash.  The same file runs
    on the GPU through OpenVINO and on the CPU through ONNX Runtime.
    The vision model was trained to embed images into the text model's
-   space, so that text queries can find them.  */
+   space, so that text queries can find them.  Whisper is an export
+   by Hugging Face's optimum, in float32, which runs faster than float16
+   on the CPU; whisper.c runs it.  */
 
 #include "model.h"
 #include "common.h"
@@ -18,6 +20,7 @@
 #include "onnx-embed.h"
 #include "ov-embed.h"
 #include "tokenizer.h"
+#include "whisper.h"
 
 #include <errno.h>
 #include <error.h>
@@ -67,6 +70,23 @@ static const struct model_source vision_source = {
   "e3a725bce72db07ca4adb1d83da08903f3ee02f8/",
   "models/nomic-embed-vision-v1.5/", "187 MB",
   sizeof vision_files / sizeof *vision_files, vision_files
+};
+
+static const struct model_file speech_files[] = {
+  { "onnx/encoder_model.onnx", "encoder_model.onnx",
+    "a9f3b752833b49e880dec91ee5b6d936112be7c3ea07c221024ba493439f46fe" },
+  { "onnx/decoder_model_merged.onnx", "decoder_model_merged.onnx",
+    "514903744bb1b45803ec571af99b31110491c6f77b0a154825866995fb124b73" },
+  { "vocab.json", "vocab.json",
+    "50d6a919f0a0601d56a04eb583c780d18553aa388254ba3158eb6a00f13e2c1a" },
+};
+
+static const struct model_source speech_source = {
+  SPEECH_MODEL,
+  "https://huggingface.co/onnx-community/whisper-base/resolve/"
+  "27a07b4b52b3a4c5886134bb4320e93e1a4bbc7c/",
+  "models/whisper-base/", "290 MB",
+  sizeof speech_files / sizeof *speech_files, speech_files
 };
 
 /* How the vision model expects pixels to be scaled, per channel (those
@@ -288,4 +308,50 @@ vision_embed (struct vision *v, const unsigned char *rgb, float **vec,
   if (v->gpu)
     return ov_embed_image (v->gpu, v->pixels, vec, dim);
   return onnx_embed_image (v->cpu, v->pixels, VISION_SIDE, vec, dim);
+}
+
+struct speech
+{
+  struct whisper *whisper;
+};
+
+struct speech *
+speech_open (bool use_gpu)
+{
+  struct speech *s;
+  char *paths[3], *cache;
+
+  if (!fetch_model (&speech_source))
+    return NULL;
+  cache = use_gpu ? cache_dir () : NULL;
+  s = xmalloc (sizeof *s);
+  for (size_t i = 0; i < 3; i++)
+    paths[i] = local_path (&speech_source, i);
+  s->whisper = whisper_load (paths[0], paths[1], paths[2], CPU_THREADS,
+                             cache);
+  for (size_t i = 0; i < 3; i++)
+    free (paths[i]);
+  free (cache);
+  if (!s->whisper)
+    {
+      free (s);
+      return NULL;
+    }
+  return s;
+}
+
+void
+speech_close (struct speech *s)
+{
+  if (!s)
+    return;
+  whisper_free (s->whisper);
+  free (s);
+}
+
+bool
+speech_transcribe (struct speech *s, const float *pcm, size_t n,
+                   struct buf *out)
+{
+  return whisper_transcribe (s->whisper, pcm, n, out);
 }

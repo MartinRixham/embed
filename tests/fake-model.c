@@ -8,6 +8,7 @@
 
 #include "fake-model.h"
 #include "../model.h"
+#include "../common.h"
 
 #include <error.h>
 #include <math.h>
@@ -161,5 +162,47 @@ vision_embed (struct vision *v, const unsigned char *rgb, float **vec,
     p[i] /= norm;
   *vec = p;
   *dim = FAKE_DIM;
+  return true;
+}
+
+struct speech
+{
+  int unused;
+};
+
+struct speech *
+speech_open (bool use_gpu)
+{
+  const char *state = getenv ("FAKE_SPEECH");
+
+  (void) use_gpu;
+  if (state && strcmp (state, "fail") == 0)
+    {
+      error (0, 0, "fake speech model cannot be opened");
+      return NULL;
+    }
+  return malloc (sizeof (struct speech));
+}
+
+void
+speech_close (struct speech *s)
+{
+  free (s);
+}
+
+bool
+speech_transcribe (struct speech *s, const float *pcm, size_t n,
+                   struct buf *out)
+{
+  char line[64];
+  double sum = 0;
+
+  (void) s;
+  snprintf (line, sizeof line, "SPEECH %zu", n);
+  log_text (line);
+  for (size_t i = 0; i < n; i++)
+    sum += (double) pcm[i] * pcm[i];
+  if (n > 0 && sum / n > 0.001)
+    buf_puts (out, " sonata");
   return true;
 }

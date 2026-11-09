@@ -13,14 +13,16 @@
    there is a usable one.  Images and videos are also embedded by what
    they show: nomic-embed-vision embeds an image, or a few frames of a
    video, into the same space as the text, from pixels that ffmpeg
-   decodes.  The results are appended to
+   decodes.  Speech in audio and video files is transcribed by Whisper,
+   from a few windows spread through them, and the transcript embedded
+   with the rest of the text.  The results are appended to
    ~/.local/share/embed/embeddings.txt, one file per line:
 
-     MTIME SIZE <tab> PATH <tab> TEXT-VECTOR [<tab> PICTURE-VECTOR]
+     MTIME SIZE VERSION <tab> PATH <tab> TEXT-VECTOR <tab> PICTURE-VECTOR
 
-   where the picture vector is "-" for a file that has none.  Records
-   from before pictures were embedded lack the last field; such files
-   are checked again, and embedded again if they are pictures.
+   where the picture vector is "-" for a file that has none.  The
+   version of the record format is always 1 for now; it is written
+   but not yet read.
    Files whose size and modification time are unchanged since the last
    run are skipped, so the program can be rerun cheaply.  */
 
@@ -52,6 +54,13 @@
 /* Bytes in a picture for the vision model.  */
 #define PICTURE_BYTES (3 * VISION_SIDE * VISION_SIDE)
 
+/* How many windows of speech to transcribe at most: the whole of a
+   short recording, and windows spread through a long one.  */
+#define SPEECH_WINDOWS 4
+
+/* The version of the record format; see above.  */
+#define VERSION 1
+
 /* An entry loaded from an existing store.  */
 struct entry
 {
@@ -60,16 +69,13 @@ struct entry
   long long size;
   size_t line;                  /* Line number of the newest record.  */
   bool seen;                    /* Found during this run's walk.  */
-  bool checked;                 /* The record has a picture field.  */
 };
 
 static struct entry *entries;
 static size_t n_entries;
 
 /* KEEP[N] is nonzero if line N of the store should survive
-   compaction: KEEP_LINE to keep it as it is, KEEP_NO_PICTURE to add
-   an empty picture field to it.  */
-enum { KEEP_LINE = 1, KEEP_NO_PICTURE = 2 };
+   compaction.  */
 static char *keep;
 static size_t n_lines, keep_cap;
 
@@ -82,9 +88,12 @@ static bool include_hidden;
 static bool use_cpu;
 static long helper_timeout = 2;
 
-/* The vision model, opened when the first picture needs it.  */
+/* The vision and speech models, each opened when the first file needs
+   it.  */
 static struct vision *vision;
 static bool vision_tried;
+static struct speech *speech;
+static bool speech_tried;
 
 static struct option const long_options[] = {
   {"all", no_argument, NULL, 'a'},
@@ -107,7 +116,7 @@ usage (int status)
           "Embed every file under each DIRECTORY (default: $HOME) with "
           "the local\nmodel %s, which is downloaded if it is missing.\n"
           "Images and videos are also embedded by what they show, with "
-          "%s.\n\n"
+          "%s,\nand speech in audio and video is transcribed by %s.\n\n"
           "  -a, --all            include hidden files and directories\n"
           "      --cpu            run the model on the CPU even if there is "
           "a GPU\n"
@@ -115,7 +124,7 @@ usage (int status)
           "      --help           display this help and exit\n"
           "      --version        output version information and exit\n\n"
           "Embeddings are stored in ~/.local/share/embed/embeddings.txt.\n",
-          EMBED_MODEL, VISION_MODEL);
+          EMBED_MODEL, VISION_MODEL, SPEECH_MODEL);
   exit (status);
 }
 
@@ -217,7 +226,6 @@ load_store (const char *path, char *model, size_t model_size)
       entries[n_entries].size = size;
       entries[n_entries].line = n_lines - 1;
       entries[n_entries].seen = false;
-      entries[n_entries].checked = strchr (tab2 + 1, '\t') != NULL;
       n_entries++;
     }
   free (line);
@@ -383,6 +391,129 @@ textual_mime (const char *mime)
   return false;
 }
 
+/* Whether a file of type MIME can be embedded by what it shows.  */
+static bool
+picture_mime (const char *mime)
+{
+  return starts_with (mime, "image/") || starts_with (mime, "video/");
+}
+
+/* Return the MIME type of FILE, freshly allocated, or NULL.  */
+static char *
+file_mime (magic_t magic_mime, const char *file)
+{
+  const char *mime = magic_file (magic_mime, file);
+  return mime ? xstrdup (mime) : NULL;
+}
+
+/* Return the length of the audio or video FILE in seconds, or a
+   negative number if it is unknown.  */
+static double
+media_duration (const char *file)
+{
+  const char *argv[] = { "ffprobe", "-v", "quiet", "-show_entries",
+                         "format=duration", "-of", "default=nw=1:nk=1",
+                         file, NULL };
+  struct buf out;
+  double d;
+  char *end;
+
+  buf_init (&out);
+  run_capture (argv, &out, 64);
+  d = strtod (out.data, &end);
+  if (end == out.data || !(d > 0) || d > 1e9)
+    d = -1;
+  buf_free (&out);
+  return d;
+}
+
+/* Return the speech model, opening it if this is the first time it is
+   needed, or NULL if it cannot be opened.  */
+static struct speech *
+get_speech (void)
+{
+  if (!speech_tried)
+    {
+      speech_tried = true;
+      speech = speech_open (!use_cpu);
+      if (!speech)
+        error (0, 0, "cannot open the %s model; audio and videos will be "
+               "indexed without their speech", SPEECH_MODEL);
+    }
+  return speech;
+}
+
+/* Decode up to SPEECH_SAMPLES of the sound of FILE, from AT seconds in,
+   as mono at SPEECH_RATE, into PCM.  Return the number of samples.  */
+static size_t
+grab_audio (const char *file, double at, float *pcm)
+{
+  char seek[32], length[32];
+  struct buf url, out;
+  const char *argv[] = { "ffmpeg", "-nostdin", "-v", "quiet", "-ss", seek,
+                         "-t", length, "-i", NULL, "-vn", "-ac", "1",
+                         "-ar", NULL, "-f", "f32le", "-", NULL };
+  char rate[16];
+  size_t n;
+
+  snprintf (seek, sizeof seek, "%.3f", at);
+  snprintf (length, sizeof length, "%d", SPEECH_SAMPLES / SPEECH_RATE);
+  snprintf (rate, sizeof rate, "%d", SPEECH_RATE);
+  buf_init (&url);
+  buf_puts (&url, "file:");
+  buf_puts (&url, file);
+  argv[9] = url.data;
+  argv[14] = rate;
+
+  buf_init (&out);
+  run_capture (argv, &out, SPEECH_SAMPLES * sizeof *pcm);
+  n = out.len / sizeof *pcm;
+  memcpy (pcm, out.data, n * sizeof *pcm);
+  buf_free (&out);
+  buf_free (&url);
+  return n;
+}
+
+/* Append to OUT what is said in FILE: the transcripts of up to
+   SPEECH_WINDOWS windows, together covering the whole of a short
+   recording and spread evenly through a long one.  */
+static void
+transcribe (struct speech *sp, const char *file, struct buf *out)
+{
+  const double window = (double) SPEECH_SAMPLES / SPEECH_RATE;
+  double duration = media_duration (file);
+  size_t n_windows = 1, start = out->len;
+  float *pcm = xmalloc (SPEECH_SAMPLES * sizeof *pcm);
+
+  if (duration > 0)
+    n_windows = duration / window + 1 < SPEECH_WINDOWS
+      ? (size_t) (duration / window) + 1 : SPEECH_WINDOWS;
+  for (size_t i = 0; i < n_windows && !interrupted; i++)
+    {
+      double at = 0;
+      size_t n;
+
+      if (duration > SPEECH_WINDOWS * window)
+        at = (duration - window) * i / (n_windows - 1);
+      else
+        at = i * window;
+      n = grab_audio (file, at, pcm);
+      if (n < SPEECH_RATE / 10)
+        continue;
+      if (out->len > start)
+        buf_puts (out, " ...");
+      if (!speech_transcribe (sp, pcm, n, out)
+          || out->len - start > MAX_CONTENT)
+        break;
+    }
+  free (pcm);
+  if (out->len - start > MAX_CONTENT)
+    {
+      out->len = start + MAX_CONTENT;
+      out->data[out->len] = '\0';
+    }
+}
+
 /* Append a textual rendering of the content of FILE, of type MIME, to
    OUT.  */
 static void
@@ -414,7 +545,20 @@ extract_content (const char *file, const char *mime, struct buf *out)
                              ("format=duration:format_tags"
                               ":stream=codec_name,width,height"),
                              "-of", "default=nw=1", file, NULL };
+      struct speech *sp = get_speech ();
+      struct buf said;
+
       run_capture (argv, out, MAX_CONTENT);
+      buf_init (&said);
+      if (sp)
+        transcribe (sp, file, &said);
+      if (said.len > 0)
+        {
+          buf_puts (out, "Speech:");
+          buf_puts (out, said.data);
+          buf_puts (out, "\n");
+        }
+      buf_free (&said);
     }
   else if (starts_with (mime, "application/vnd.openxmlformats")
            || starts_with (mime, "application/vnd.oasis.opendocument"))
@@ -436,21 +580,6 @@ extract_content (const char *file, const char *mime, struct buf *out)
                   : MAX_CONTENT);
       buf_free (&tmp);
     }
-}
-
-/* Whether a file of type MIME can be embedded by what it shows.  */
-static bool
-picture_mime (const char *mime)
-{
-  return starts_with (mime, "image/") || starts_with (mime, "video/");
-}
-
-/* Return the MIME type of FILE, freshly allocated, or NULL.  */
-static char *
-file_mime (magic_t magic_mime, const char *file)
-{
-  const char *mime = magic_file (magic_mime, file);
-  return mime ? xstrdup (mime) : NULL;
 }
 
 /* Decode one frame of FILE, from AT seconds in if AT is not negative,
@@ -510,27 +639,6 @@ grab_frame (const char *file, double at, unsigned char *rgb)
   return ok;
 }
 
-/* Return the length of the video FILE in seconds, or a negative
-   number if it is unknown.  */
-static double
-video_duration (const char *file)
-{
-  const char *argv[] = { "ffprobe", "-v", "quiet", "-show_entries",
-                         "format=duration", "-of", "default=nw=1:nk=1",
-                         file, NULL };
-  struct buf out;
-  double d;
-  char *end;
-
-  buf_init (&out);
-  run_capture (argv, &out, 64);
-  d = strtod (out.data, &end);
-  if (end == out.data || !(d > 0) || d > 1e9)
-    d = -1;
-  buf_free (&out);
-  return d;
-}
-
 /* Return the vision model, opening it if this is the first time it is
    needed, or NULL if it cannot be opened.  */
 static struct vision *
@@ -556,7 +664,7 @@ embed_picture (struct vision *vis, const char *file, const char *mime,
                size_t dim)
 {
   bool video = starts_with (mime, "video/");
-  double duration = video ? video_duration (file) : -1;
+  double duration = video ? media_duration (file) : -1;
   size_t n_frames = duration > 0 ? VIDEO_FRAMES : 1, got = 0;
   unsigned char *rgb = xmalloc (PICTURE_BYTES);
   float *sum = xmalloc (dim * sizeof *sum);
@@ -651,26 +759,21 @@ embed_checked (struct model *m, const char *text, size_t dim, float **vec)
   return false;
 }
 
-/* Write a store record for FILE to F and return true on success.  VEC
-   is the embedding of its text, and PICTURE that of what it shows, if
-   anything.  Unless CHECKED, leave out the picture field, so that the
-   file will be looked at again: the picture could not be embedded,
-   though it might be one.  */
+/* Write a store record for FILE to F and return
+   true on success.  VEC is the embedding of its text, and PICTURE that
+   of what it shows, if anything.  */
 static bool
 write_record (FILE *f, const char *file, const struct stat *st,
-              const float *vec, const float *picture, bool checked,
-              size_t dim)
+              const float *vec, const float *picture, size_t dim)
 {
-  fprintf (f, "%lld %lld\t%s\t", (long long) st->st_mtime,
-           (long long) st->st_size, file);
+  fprintf (f, "%lld %lld %d\t%s\t", (long long) st->st_mtime,
+           (long long) st->st_size, VERSION, file);
   write_hex_vector (f, vec, dim);
+  putc ('\t', f);
   if (picture)
-    {
-      putc ('\t', f);
-      write_hex_vector (f, picture, dim);
-    }
-  else if (checked)
-    fputs ("\t-", f);
+    write_hex_vector (f, picture, dim);
+  else
+    putc ('-', f);
   putc ('\n', f);
   return fflush (f) == 0 && !ferror (f);
 }
@@ -713,15 +816,7 @@ compact_store (const char *path)
   while ((len = getline (&line, &line_size, in)) > 0)
     {
       if (n < n_lines && keep[n] && line[len - 1] == '\n')
-        {
-          if (keep[n] == KEEP_NO_PICTURE)
-            {
-              fwrite (line, 1, len - 1, out);
-              fputs ("\t-\n", out);
-            }
-          else
-            fwrite (line, 1, len, out);
-        }
+        fwrite (line, 1, len, out);
       n++;
     }
   free (line);
@@ -857,7 +952,6 @@ main (int argc, char **argv)
       struct buf text;
       char *mime = NULL;
       float *picture = NULL;
-      bool checked;
 
       if (ent->fts_level > 0 && ent->fts_name[0] == '.' && !include_hidden)
         {
@@ -881,25 +975,8 @@ main (int argc, char **argv)
           if (e->mtime == ent->fts_statp->st_mtime
               && e->size == ent->fts_statp->st_size && dim > 0)
             {
-              /* A record from before pictures were embedded needs
-                 doing again if the file is a picture, and only marking
-                 as checked otherwise.  */
-              if (!e->checked)
-                mime = file_mime (magic_mime, ent->fts_path);
-              if (e->checked || !mime
-                  || (picture_mime (mime) && !get_vision ()))
-                {
-                  free (mime);
-                  n_same++;
-                  continue;
-                }
-              if (!picture_mime (mime))
-                {
-                  keep[e->line] = KEEP_NO_PICTURE;
-                  free (mime);
-                  n_same++;
-                  continue;
-                }
+              n_same++;
+              continue;
             }
         }
 
@@ -922,29 +999,18 @@ main (int argc, char **argv)
 
       if (!ok)
         {
-          free (mime);
           n_failed++;
           error (0, 0, "%s: could not embed", ent->fts_path);
           continue;
         }
 
-      if (!mime)
-        mime = file_mime (magic_mime, ent->fts_path);
-      checked = mime != NULL;
-      if (mime && picture_mime (mime))
-        {
-          struct vision *vis = get_vision ();
-
-          if (vis)
-            picture = embed_picture (vis, ent->fts_path, mime, dim);
-          /* Try again next time if the model is missing, or this run
-             was interrupted in the middle of the file.  */
-          checked = vis && !interrupted;
-        }
+      mime = file_mime (magic_mime, ent->fts_path);
+      if (mime && picture_mime (mime) && get_vision ())
+        picture = embed_picture (vision, ent->fts_path, mime, dim);
       free (mime);
 
       if (!write_record (out, ent->fts_path, ent->fts_statp, vec, picture,
-                         checked, dim))
+                         dim))
         error (EXIT_FAILURE, errno, "%s", store);
       free (vec);
       free (picture);
@@ -965,6 +1031,7 @@ main (int argc, char **argv)
   fts_close (fts);
   model_close (model);
   vision_close (vision);
+  speech_close (speech);
   if (fclose (out) != 0)
     error (EXIT_FAILURE, errno, "%s", store);
 

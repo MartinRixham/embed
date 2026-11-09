@@ -55,6 +55,7 @@ setup (void)
   setenv ("FAKE_MODEL_LOG", fx.log, 1);
   unsetenv ("FAKE_MODEL");
   unsetenv ("FAKE_VISION");
+  unsetenv ("FAKE_SPEECH");
 }
 
 static void
@@ -104,13 +105,14 @@ err_text (void)
 }
 
 /* Return the number of texts embedded, not counting opening the
-   model.  */
+   model or transcribing.  */
 static size_t
 requests (void)
 {
   char *log = read_file (fx.log);
 
-  return count_substr (log, "\n----\n") - count_substr (log, "open gpu=");
+  return count_substr (log, "\n----\n") - count_substr (log, "open gpu=")
+    - count_substr (log, "SPEECH ");
 }
 
 /* Return the number of records for HOME/NAME in the store.  */
@@ -750,14 +752,12 @@ START_TEST (test_write_record_format)
 
   float pic[3] = { 1, 0, -2 };
 
-  ck_assert (write_record (f, "/a/b c", &st, v, NULL, false, 3));
-  ck_assert (write_record (f, "/d", &st, v, NULL, true, 3));
-  ck_assert (write_record (f, "/e", &st, v, pic, true, 3));
+  ck_assert (write_record (f, "/a/b c", &st, v, NULL, 3));
+  ck_assert (write_record (f, "/e", &st, v, pic, 3));
   fclose (f);
   ck_assert_str_eq (read_file (p),
-                    "1700000000 42\t/a/b c\t3f000000be80000033d6bf95\n"
-                    "1700000000 42\t/d\t3f000000be80000033d6bf95\t-\n"
-                    "1700000000 42\t/e\t3f000000be80000033d6bf95\t"
+                    "1700000000 42 1\t/a/b c\t3f000000be80000033d6bf95\t-\n"
+                    "1700000000 42 1\t/e\t3f000000be80000033d6bf95\t"
                     "3f80000000000000c0000000\n");
 }
 END_TEST
@@ -770,7 +770,7 @@ START_TEST (test_write_record_full_disk)
 
   if (!f)
     return;
-  ck_assert (!write_record (f, "/x", &st, v, NULL, true, 1));
+  ck_assert (!write_record (f, "/x", &st, v, NULL, 1));
   fclose (f);
 }
 END_TEST
@@ -851,23 +851,6 @@ START_TEST (test_load_store_dedupes_and_skips_junk)
 }
 END_TEST
 
-START_TEST (test_load_store_picture_field)
-{
-  char model[64];
-
-  write_file (fx.store,
-              "# embed-index model=m dim=1\n"
-              "1 1\t/old\t3f800000\n"
-              "1 1\t/none\t3f800000\t-\n"
-              "1 1\t/pic\t3f800000\t3f800000\n",
-              (size_t) -1);
-  ck_assert (load_store (fx.store, model, sizeof model));
-  ck_assert (!find_entry ("/old")->checked);
-  ck_assert (find_entry ("/none")->checked);
-  ck_assert (find_entry ("/pic")->checked);
-}
-END_TEST
-
 START_TEST (test_load_store_many)
 {
   char model[64];
@@ -911,17 +894,6 @@ START_TEST (test_compact_store)
   if (asprintf (&tmp, "%s.tmp", fx.store) < 0)
     abort ();
   ck_assert_int_ne (stat (tmp, &st), 0);
-}
-END_TEST
-
-START_TEST (test_compact_store_adds_picture_field)
-{
-  write_file (fx.store, "# h\na\tb\tc\nd\te\tf\n", (size_t) -1);
-  keep_push (KEEP_LINE);
-  keep_push (KEEP_NO_PICTURE);
-  keep_push (KEEP_LINE);
-  compact_store (fx.store);
-  ck_assert_str_eq (read_file (fx.store), "# h\na\tb\tc\t-\nd\te\tf\n");
 }
 END_TEST
 
@@ -1617,19 +1589,19 @@ START_TEST (test_grab_frame_seeks)
   ck_assert (all_colour (rgb, 0, 0, 255));
   /* Past the end there is nothing.  */
   ck_assert (!grab_frame (p, 60, rgb));
-  ck_assert_double_eq_tol (video_duration (p), 4.0, 0.2);
+  ck_assert_double_eq_tol (media_duration (p), 4.0, 0.2);
   free (p);
   free (rgb);
 }
 END_TEST
 
-START_TEST (test_video_duration_unknown)
+START_TEST (test_media_duration_unknown)
 {
   char *p;
 
   put ("notes.txt", "not a video");
   p = home_file ("notes.txt");
-  ck_assert_double_lt (video_duration (p), 0);
+  ck_assert_double_lt (media_duration (p), 0);
   free (p);
 }
 END_TEST
@@ -1764,56 +1736,30 @@ START_TEST (test_index_pictures)
 }
 END_TEST
 
-START_TEST (test_index_upgrades_old_store)
+/* Return the version in the record for HOME/NAME.  */
+static int
+version_of (const char *name)
 {
-  char *store, *line;
-  struct stat st;
-  FILE *f;
+  char *rec = record_of (name);
+  long long a, b;
+  int v;
 
-  if (!have_program ("ffmpeg"))
-    return;
-  put ("notes.txt", "alpha");
-  shell ("ffmpeg -v quiet -f lavfi -i color=red:s=64x64 -frames:v 1 "
-         "red.png");
-  ck_assert_int_eq (run_index (NULL), 0);
-
-  /* Make it look as if it was written before pictures were embedded,
-     dropping the last field of each record.  */
-  store = read_file (fx.store);
-  f = fopen (fx.store, "w");
-  for (line = strtok (store, "\n"); line; line = strtok (NULL, "\n"))
-    {
-      char *tab = strchr (line, '\t');
-      if (tab && (tab = strchr (tab + 1, '\t'))
-          && (tab = strchr (tab + 1, '\t')))
-        *tab = '\0';
-      fprintf (f, "%s\n", line);
-    }
-  fclose (f);
-  ck_assert_ptr_null (picture_field ("notes.txt"));
-  ck_assert_ptr_null (picture_field ("red.png"));
-  char *old_notes = record_of ("notes.txt");
-
-  /* The text file is only marked, and the picture embedded again.  */
-  truncate (fx.log, 0);
-  ck_assert_int_eq (run_index (NULL), 0);
-  ck_assert_ptr_nonnull (strstr (err_text (), "embedded 1, unchanged 1"));
-  ck_assert_uint_eq (count_substr (read_file (fx.log), "notes.txt"), 0);
-  ck_assert_uint_eq (count_substr (read_file (fx.log), "red.png"), 1);
-  ck_assert_uint_eq (record_count (), 2);
-  ck_assert_str_eq (picture_field ("notes.txt"), "-");
-  ck_assert (strncmp (record_of ("notes.txt"), old_notes,
-                      strlen (old_notes)) == 0);
-  ck_assert_str_ne (picture_field ("red.png"), "-");
-
-  /* After which there is nothing to do.  */
-  ck_assert_int_eq (stat (fx.store, &st), 0);
-  store = read_file (fx.store);
-  ck_assert_int_eq (run_index (NULL), 0);
-  ck_assert_ptr_nonnull (strstr (err_text (), "embedded 0, unchanged 2"));
-  ck_assert_str_eq (read_file (fx.store), store);
+  ck_assert_ptr_nonnull (rec);
+  ck_assert_int_eq (sscanf (rec, "%lld %lld %d", &a, &b, &v), 3);
+  return v;
 }
-END_TEST
+
+/* Return the text vector of the record for HOME/NAME.  */
+static char *
+text_field (const char *name)
+{
+  char *rec = record_of (name), *p;
+
+  ck_assert_ptr_nonnull (rec);
+  p = strchr (strchr (rec, '\t') + 1, '\t') + 1;
+  *strchr (p, '\t') = '\0';
+  return p;
+}
 
 START_TEST (test_index_without_vision_model)
 {
@@ -1832,18 +1778,14 @@ START_TEST (test_index_without_vision_model)
   ck_assert_ptr_nonnull (strstr (err_text (), "embedded 3, unchanged 0, "
                                  "failed 0"));
   ck_assert_str_eq (picture_field ("notes.txt"), "-");
-  ck_assert_ptr_null (picture_field ("red.png"));
+  ck_assert_str_eq (picture_field ("red.png"), "-");
+  ck_assert_int_eq (version_of ("red.png"), VERSION);
+  ck_assert_int_eq (version_of ("notes.txt"), VERSION);
 
-  /* Still missing: nothing is embedded again.  */
-  ck_assert_int_eq (run_index (NULL), 0);
-  ck_assert_ptr_nonnull (strstr (err_text (), "embedded 0, unchanged 3"));
-
-  /* Once it is there, the pictures are done.  */
+  /* Nothing is embedded again, even once the model is there.  */
   unsetenv ("FAKE_VISION");
   ck_assert_int_eq (run_index (NULL), 0);
-  ck_assert_ptr_nonnull (strstr (err_text (), "embedded 2, unchanged 1"));
-  ck_assert_str_ne (picture_field ("red.png"), "-");
-  ck_assert_str_ne (picture_field ("blue.png"), "-");
+  ck_assert_ptr_nonnull (strstr (err_text (), "embedded 0, unchanged 3"));
 }
 END_TEST
 
@@ -1854,6 +1796,173 @@ START_TEST (test_index_vision_model_only_when_needed)
   ck_assert_int_eq (run_index (NULL), 0);
   /* No pictures, so no attempt to open it.  */
   ck_assert_ptr_null (strstr (err_text (), VISION_MODEL));
+}
+END_TEST
+
+/* Speech.  */
+
+START_TEST (test_grab_audio)
+{
+  float *pcm = xmalloc (SPEECH_SAMPLES * sizeof *pcm);
+  double sum = 0;
+  size_t n;
+  char *p;
+
+  if (!have_program ("ffmpeg"))
+    return;
+  /* Stereo at 44.1 kHz, to be mixed down and resampled.  */
+  shell ("ffmpeg -v quiet -f lavfi -i sine=f=440:d=5:r=44100 -ac 2 "
+         "-af volume=0.5 tone.ogg");
+  p = home_file ("tone.ogg");
+  n = grab_audio (p, 0, pcm);
+  ck_assert_msg (n > 4.9 * SPEECH_RATE && n < 5.1 * SPEECH_RATE, "%zu", n);
+  for (size_t i = 0; i < n; i++)
+    sum += (double) pcm[i] * pcm[i];
+  /* ffmpeg's sine has an amplitude of 1/8, here halved, and a sine of
+     amplitude a has a mean square of a^2 / 2.  */
+  ck_assert_double_eq_tol (sum / n, 0.0625 * 0.0625 / 2, 0.0002);
+  n = grab_audio (p, 3, pcm);
+  ck_assert_msg (n > 1.9 * SPEECH_RATE && n < 2.1 * SPEECH_RATE, "%zu", n);
+  free (p);
+
+  /* At most a window's worth.  */
+  shell ("ffmpeg -v quiet -f lavfi -i sine=f=440:d=40 long.wav");
+  p = home_file ("long.wav");
+  ck_assert_uint_eq (grab_audio (p, 0, pcm), SPEECH_SAMPLES);
+  free (p);
+
+  /* Nothing from a picture, or from what is not a file of sound.  */
+  shell ("ffmpeg -v quiet -f lavfi -i color=red:s=64x64 -frames:v 1 "
+         "red.png");
+  p = home_file ("red.png");
+  ck_assert_uint_eq (grab_audio (p, 0, pcm), 0);
+  free (p);
+  put ("fake.mp3", "not a sound");
+  p = home_file ("fake.mp3");
+  ck_assert_uint_eq (grab_audio (p, 0, pcm), 0);
+  free (p);
+  free (pcm);
+}
+END_TEST
+
+/* Transcribe HOME/NAME with the fake model and return the text.  Store
+   the sizes of the windows it was given, as the log shows them, in
+   SIZES, and their number in *N.  */
+static char *
+fake_transcript (const char *name, size_t *sizes, size_t *n)
+{
+  struct speech *sp = speech_open (false);
+  struct buf out;
+  char *p = home_file (name), *log, *q;
+
+  truncate (fx.log, 0);
+  buf_init (&out);
+  transcribe (sp, p, &out);
+  speech_close (sp);
+  free (p);
+  *n = 0;
+  log = read_file (fx.log);
+  for (q = log; q && (q = strstr (q, "SPEECH ")); q++)
+    sizes[(*n)++] = strtoul (q + 7, NULL, 10);
+  return out.data ? out.data : strdup ("");
+}
+
+START_TEST (test_transcribe_windows)
+{
+  size_t sizes[16], n;
+  char *text;
+
+  if (!have_program ("ffmpeg"))
+    return;
+  /* A short recording is done whole, in windows one after another.  */
+  shell ("ffmpeg -v quiet -f lavfi -i sine=f=440:d=70 -af volume=0.5 "
+         "short.ogg");
+  text = fake_transcript ("short.ogg", sizes, &n);
+  ck_assert_str_eq (text, " sonata ... sonata ... sonata");
+  ck_assert_uint_eq (n, 3);
+  ck_assert_uint_eq (sizes[0], SPEECH_SAMPLES);
+  ck_assert_uint_eq (sizes[1], SPEECH_SAMPLES);
+  ck_assert_msg (sizes[2] > 9.9 * SPEECH_RATE && sizes[2] < 10.1
+                 * SPEECH_RATE, "%zu", sizes[2]);
+
+  /* A long one in SPEECH_WINDOWS full windows spread through it.  */
+  shell ("ffmpeg -v quiet -f lavfi -i sine=f=440:d=300 -af volume=0.5 "
+         "-c:a libopus -b:a 16k long.ogg || ffmpeg -v quiet -f lavfi "
+         "-i sine=f=440:d=300 -af volume=0.5 long.ogg");
+  text = fake_transcript ("long.ogg", sizes, &n);
+  ck_assert_uint_eq (n, SPEECH_WINDOWS);
+  for (size_t i = 0; i < n; i++)
+    ck_assert_msg (sizes[i] > SPEECH_SAMPLES - SPEECH_RATE / 10,
+                   "window %zu: %zu", i, sizes[i]);
+
+  /* A quiet one says nothing.  */
+  shell ("ffmpeg -v quiet -f lavfi -i sine=f=440:d=5 -af volume=0.01 "
+         "quiet.ogg");
+  ck_assert_str_eq (fake_transcript ("quiet.ogg", sizes, &n), "");
+  ck_assert_uint_eq (n, 1);
+
+  /* A video with no sound is not transcribed at all.  */
+  shell ("ffmpeg -v quiet -f lavfi -i color=blue:s=64x64:d=2 silent.mkv");
+  ck_assert_str_eq (fake_transcript ("silent.mkv", sizes, &n), "");
+  ck_assert_uint_eq (n, 0);
+}
+END_TEST
+
+START_TEST (test_index_speech)
+{
+  if (!have_program ("ffmpeg"))
+    return;
+  shell ("ffmpeg -v quiet -f lavfi -i sine=f=440:d=3 -af volume=0.5 "
+         "talk.ogg");
+  shell ("ffmpeg -v quiet -f lavfi -i color=blue:s=64x64:d=3 -f lavfi "
+         "-i sine=f=440:d=3 -af volume=0.5 -shortest film.mkv");
+  ck_assert_int_eq (run_index (NULL), 0);
+  /* The transcript is embedded with the rest of the text, after the
+     tags.  */
+  ck_assert_uint_eq (count_substr (read_file (fx.log), "\nSpeech: sonata\n"),
+                     2);
+  ck_assert_int_eq (version_of ("talk.ogg"), VERSION);
+  ck_assert_int_eq (version_of ("film.mkv"), VERSION);
+  /* The video has its picture as well.  */
+  ck_assert_str_ne (picture_field ("film.mkv"), "-");
+  ck_assert_str_eq (picture_field ("talk.ogg"), "-");
+}
+END_TEST
+
+START_TEST (test_index_without_speech_model)
+{
+  if (!have_program ("ffmpeg"))
+    return;
+  put ("notes.txt", "alpha");
+  shell ("ffmpeg -v quiet -f lavfi -i sine=f=440:d=3 -af volume=0.5 "
+         "a.ogg");
+  shell ("ffmpeg -v quiet -f lavfi -i sine=f=440:d=3 -af volume=0.5 "
+         "b.ogg");
+  shell ("ffmpeg -v quiet -f lavfi -i color=red:s=64x64 -frames:v 1 "
+         "red.png");
+  setenv ("FAKE_SPEECH", "fail", 1);
+  ck_assert_int_eq (run_index (NULL), 0);
+  ck_assert_uint_eq (count_substr (err_text (), "cannot open the "
+                                   SPEECH_MODEL), 1);
+  ck_assert_ptr_nonnull (strstr (err_text (), "embedded 4, unchanged 0, "
+                                 "failed 0"));
+  ck_assert_int_eq (version_of ("a.ogg"), VERSION);
+  ck_assert_int_eq (version_of ("red.png"), VERSION);
+  ck_assert_ptr_null (strstr (read_file (fx.log), "Speech:"));
+
+  /* Nothing is done again, even once the model is there.  */
+  unsetenv ("FAKE_SPEECH");
+  ck_assert_int_eq (run_index (NULL), 0);
+  ck_assert_ptr_nonnull (strstr (err_text (), "embedded 0, unchanged 4"));
+}
+END_TEST
+
+START_TEST (test_index_speech_model_only_when_needed)
+{
+  put ("notes.txt", "alpha");
+  setenv ("FAKE_SPEECH", "fail", 1);
+  ck_assert_int_eq (run_index (NULL), 0);
+  ck_assert_ptr_null (strstr (err_text (), SPEECH_MODEL));
 }
 END_TEST
 
@@ -1914,12 +2023,21 @@ index_suite (void)
   tcase_add_test (tc, test_grab_frame_odd_names);
   tcase_add_test (tc, test_grab_frame_not_a_picture);
   tcase_add_test (tc, test_grab_frame_seeks);
-  tcase_add_test (tc, test_video_duration_unknown);
+  tcase_add_test (tc, test_media_duration_unknown);
   tcase_add_test (tc, test_embed_picture_averages_frames);
   tcase_add_test (tc, test_index_pictures);
-  tcase_add_test (tc, test_index_upgrades_old_store);
   tcase_add_test (tc, test_index_without_vision_model);
   tcase_add_test (tc, test_index_vision_model_only_when_needed);
+  suite_add_tcase (s, tc);
+
+  tc = tcase_create ("speech");
+  tcase_add_checked_fixture (tc, setup, teardown);
+  tcase_set_timeout (tc, 60);
+  tcase_add_test (tc, test_grab_audio);
+  tcase_add_test (tc, test_transcribe_windows);
+  tcase_add_test (tc, test_index_speech);
+  tcase_add_test (tc, test_index_without_speech_model);
+  tcase_add_test (tc, test_index_speech_model_only_when_needed);
   suite_add_tcase (s, tc);
 
   tc = tcase_create ("store");
@@ -1932,10 +2050,8 @@ index_suite (void)
   tcase_add_exit_test (tc, test_load_store_empty_file, EXIT_FAILURE);
   tcase_add_test (tc, test_load_store_header_only);
   tcase_add_test (tc, test_load_store_dedupes_and_skips_junk);
-  tcase_add_test (tc, test_load_store_picture_field);
   tcase_add_test (tc, test_load_store_many);
   tcase_add_test (tc, test_compact_store);
-  tcase_add_test (tc, test_compact_store_adds_picture_field);
   suite_add_tcase (s, tc);
 
   tc = tcase_create ("program");
