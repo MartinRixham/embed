@@ -51,6 +51,8 @@ setup (void)
   setenv ("HOME", fx.home, 1);
   setenv ("FAKE_MODEL_LOG", fx.log, 1);
   unsetenv ("FAKE_MODEL");
+  unsetenv ("FAKE_VISION");
+  unsetenv ("FAKE_SPEECH");
 }
 
 static void
@@ -606,6 +608,289 @@ START_TEST (test_round_trip_with_indexer)
 }
 END_TEST
 
+/* --file.  */
+
+/* Append to B a record for PATH, with the modification time and size of
+   ST (or 1 and 1 if ST is NULL), a text vector along dimension TEXT and
+   a picture vector along dimension PICTURE, or none if PICTURE is
+   negative.  */
+static void
+add_record (struct buf *b, const char *path, const struct stat *st,
+            int text, int picture)
+{
+  char line[512];
+  char *hex = unit_hex (text);
+
+  snprintf (line, sizeof line, "%lld %lld 1\t%s\t%s\t",
+            st ? (long long) st->st_mtime : 1LL,
+            st ? (long long) st->st_size : 1LL, path, hex);
+  buf_puts (b, line);
+  free (hex);
+  if (picture >= 0)
+    {
+      hex = unit_hex (picture);
+      buf_puts (b, hex);
+      free (hex);
+    }
+  else
+    buf_puts (b, "-");
+  buf_puts (b, "\n");
+}
+
+static void
+start_store (struct buf *b)
+{
+  char line[128];
+
+  buf_init (b);
+  snprintf (line, sizeof line, "# embed-index model=%s dim=%d\n",
+            EMBED_MODEL, FAKE_DIM);
+  buf_puts (b, line);
+}
+
+static void
+finish_store (struct buf *b)
+{
+  write_file (fx.store, b->data, b->len);
+  buf_free (b);
+}
+
+/* Read up to N lines of "SCORE\tPATH" from the output into SCORE and
+   PATH, and return how many there were.  */
+static int
+read_scores (int n, double *score, char path[][256])
+{
+  char *out = out_text (), *p = out;
+  int got = 0;
+
+  while (got < n && sscanf (p, "%lf\t%255[^\n]", &score[got], path[got])
+         == 2)
+    {
+      got++;
+      if (!(p = strchr (p, '\n')))
+        break;
+      p++;
+    }
+  free (out);
+  return got;
+}
+
+START_TEST (test_file_uses_fresh_record)
+{
+  char *q = path_join (fx.home, "q.txt");
+  struct stat st;
+  struct buf b;
+  double score[4];
+  char path[4][256];
+
+  write_file (q, "whatever", (size_t) -1);
+  ck_assert_int_eq (stat (q, &st), 0);
+  start_store (&b);
+  add_record (&b, "/h/a", NULL, 0, -1);
+  add_record (&b, q, &st, 1, -1);
+  add_record (&b, "/h/b", NULL, 1, -1);
+  finish_store (&b);
+
+  ck_assert_int_eq (run_query ("-s", "--file", q, NULL), 0);
+  /* The stored vector, along keyword 1, is the query, and the file
+     itself is left out.  */
+  ck_assert_int_eq (read_scores (4, score, path), 2);
+  ck_assert_str_eq (path[0], "/h/b");
+  ck_assert_double_eq_tol (score[0], 1, 0.001);
+  ck_assert_str_eq (path[1], "/h/a");
+  /* No model was needed.  */
+  ck_assert_ptr_null (read_file (fx.log));
+  free (q);
+}
+END_TEST
+
+START_TEST (test_file_stale_record_embeds_file)
+{
+  char *q = path_join (fx.home, "q.txt");
+  struct stat st;
+  struct buf b;
+  char *log;
+
+  /* The stored record says keyword 1, but the file, changed since, is
+     about keyword 0.  */
+  write_file (q, "sourdough sourdough", (size_t) -1);
+  ck_assert_int_eq (stat (q, &st), 0);
+  st.st_mtime--;
+  start_store (&b);
+  add_record (&b, "/h/a", NULL, 0, -1);
+  add_record (&b, "/h/b", NULL, 1, -1);
+  add_record (&b, q, &st, 1, -1);
+  finish_store (&b);
+
+  ck_assert_int_eq (run_query ("--file", q, NULL), 0);
+  ck_assert_str_eq (out_text (), "/h/a\n/h/b\n");
+  /* Described as embed-index would, as a document.  */
+  log = read_file (fx.log);
+  ck_assert_ptr_nonnull (log);
+  ck_assert_ptr_nonnull (strstr (log, "open gpu=0"));
+  ck_assert_ptr_nonnull (strstr (log, DOCUMENT_PREFIX "File name: q.txt\n"
+                                 "Location: ~\n"));
+  ck_assert_ptr_nonnull (strstr (log, "sourdough sourdough"));
+  free (log);
+  free (q);
+}
+END_TEST
+
+START_TEST (test_file_not_indexed)
+{
+  char *q = path_join (fx.root, "elsewhere/notes.txt");
+  struct buf b;
+
+  write_file (q, "An invoice, and another invoice.", (size_t) -1);
+  start_store (&b);
+  add_record (&b, "/h/a", NULL, 0, -1);
+  add_record (&b, "/h/b", NULL, 1, -1);
+  finish_store (&b);
+
+  ck_assert_int_eq (run_query ("-n", "1", "--file", q, NULL), 0);
+  ck_assert_str_eq (out_text (), "/h/b\n");
+  free (q);
+}
+END_TEST
+
+START_TEST (test_file_known_under_home)
+{
+  char *real = path_join (fx.root, "real-home");
+  char *q = path_join (real, "q.txt");
+  char *link_q;
+  struct stat st;
+  struct buf b;
+
+  /* HOME is a symbolic link, and embed-index named the file under it,
+     not under its real path.  */
+  rename (fx.home, real);
+  ck_assert_int_eq (symlink (real, fx.home), 0);
+  write_file (q, "whatever", (size_t) -1);
+  ck_assert_int_eq (stat (q, &st), 0);
+  link_q = path_join (fx.home, "q.txt");
+  start_store (&b);
+  add_record (&b, "/h/a", NULL, 0, -1);
+  add_record (&b, "/h/b", NULL, 1, -1);
+  add_record (&b, link_q, &st, 1, -1);
+  finish_store (&b);
+
+  ck_assert_int_eq (run_query ("--file", q, NULL), 0);
+  ck_assert_str_eq (out_text (), "/h/b\n/h/a\n");
+  ck_assert_ptr_null (read_file (fx.log));
+  free (link_q);
+  free (q);
+  free (real);
+}
+END_TEST
+
+START_TEST (test_file_picture_scores)
+{
+  char *q = path_join (fx.home, "q.png");
+  struct stat st;
+  struct buf b;
+  double score[4];
+  char path[4][256];
+  /* Unit vectors along dimension 2 less their mean: 7/8 at 2 and
+     -1/8 elsewhere, over a length of sqrt (7/8).  */
+  double centred = 0.875 / sqrt (0.875);
+
+  /* The query's text is along keyword 1 and its picture along
+     keyword 2.  */
+  write_file (q, "x", (size_t) -1);
+  ck_assert_int_eq (stat (q, &st), 0);
+  start_store (&b);
+  add_record (&b, q, &st, 1, 2);
+  /* A picture alike.  */
+  add_record (&b, "/h/same-picture", NULL, 5, 2);
+  /* A text about what the query's picture shows.  */
+  add_record (&b, "/h/text-of-picture", NULL, 2, -1);
+  /* A picture of what the query's text says.  */
+  add_record (&b, "/h/picture-of-text", NULL, 5, 1);
+  /* Nothing alike.  */
+  add_record (&b, "/h/other", NULL, 5, 6);
+  finish_store (&b);
+
+  ck_assert_int_eq (run_query ("-s", "--file", q, NULL), 0);
+  ck_assert_int_eq (read_scores (4, score, path), 4);
+  for (int i = 0; i < 4; i++)
+    if (strcmp (path[i], "/h/same-picture") == 0)
+      ck_assert_double_eq_tol (score[i], PAIR_OFFSET + PAIR_SCALE, 0.001);
+    else if (strcmp (path[i], "/h/other") == 0)
+      {
+        /* The best is its picture against the query's text, less its
+           mean: -1/8 over sqrt (7/8).  */
+        ck_assert_int_eq (i, 3);
+        ck_assert_double_eq_tol (score[i], PICTURE_OFFSET + PICTURE_SCALE
+                                 * -0.125 / sqrt (0.875), 0.001);
+      }
+    else
+      /* Each of the others scores across kinds.  */
+      ck_assert_double_eq_tol (score[i], PICTURE_OFFSET + PICTURE_SCALE
+                               * centred, 0.001);
+}
+END_TEST
+
+START_TEST (test_file_errors)
+{
+  char *q = path_join (fx.home, "q.txt");
+
+  write_file (q, "x", (size_t) -1);
+  make_store (EMBED_MODEL, "/a", 0, NULL);
+  ck_assert_int_eq (run_query ("--file", q, "words", NULL), EXIT_FAILURE);
+  ck_assert_ptr_nonnull (strstr (err_text (), "cannot be given with "
+                                 "--file"));
+  ck_assert_int_eq (run_query ("-f", "/nonexistent/file", NULL),
+                    EXIT_FAILURE);
+  ck_assert_ptr_nonnull (strstr (err_text (), "/nonexistent/file"));
+  ck_assert_int_eq (run_query ("-f", fx.home, NULL), EXIT_FAILURE);
+  ck_assert_ptr_nonnull (strstr (err_text (), "not a regular file"));
+  setenv ("FAKE_MODEL", "fail", 1);
+  ck_assert_int_eq (run_query ("-f", q, NULL), EXIT_FAILURE);
+  ck_assert_ptr_nonnull (strstr (err_text (), "cannot open the "
+                                 EMBED_MODEL " model"));
+  free (q);
+}
+END_TEST
+
+START_TEST (test_file_round_trip_with_indexer)
+{
+  char *cmd, *copy;
+  double score[2];
+  char path[2][256];
+
+  if (!have_program ("ffmpeg"))
+    return;
+  /* Index a picture and a text, then query with the picture under
+     another name, outside the home directory: embedded on the spot,
+     it has just the picture vector the indexer gave the original.  */
+  write_file (path_join (fx.home, "notes.txt"), "Invoice 1043.",
+              (size_t) -1);
+  if (asprintf (&cmd, "ffmpeg -v quiet -f lavfi -i color=red:s=64x64 "
+                "-frames:v 1 '%s/red.png' && '%s' 2>/dev/null", fx.home,
+                EMBED_INDEX) < 0)
+    abort ();
+  ck_assert_int_eq (system (cmd), 0);
+  free (cmd);
+  copy = path_join (fx.root, "copy.png");
+  if (asprintf (&cmd, "cp '%s/red.png' '%s'", fx.home, copy) < 0)
+    abort ();
+  ck_assert_int_eq (system (cmd), 0);
+  free (cmd);
+
+  ck_assert_int_eq (run_query ("-s", "--file", copy, NULL), 0);
+  ck_assert_int_eq (read_scores (2, score, path), 2);
+  ck_assert (strstr (path[0], "/red.png"));
+  ck_assert_double_eq_tol (score[0], PAIR_OFFSET + PAIR_SCALE, 0.001);
+  ck_assert (strstr (path[1], "/notes.txt"));
+
+  /* The original, being indexed, is left out of its own matches.  */
+  ck_assert_int_eq (run_query ("--file", path_join (fx.home, "red.png"),
+                               NULL), 0);
+  ck_assert_ptr_null (strstr (out_text (), "red.png"));
+  free (copy);
+}
+END_TEST
+
 static Suite *
 query_suite (void)
 {
@@ -647,6 +932,13 @@ query_suite (void)
   tcase_add_test (tc, test_query_picture_scores_below_text);
   tcase_add_test (tc, test_query_bad_picture_vector);
   tcase_add_test (tc, test_round_trip_with_indexer);
+  tcase_add_test (tc, test_file_uses_fresh_record);
+  tcase_add_test (tc, test_file_stale_record_embeds_file);
+  tcase_add_test (tc, test_file_not_indexed);
+  tcase_add_test (tc, test_file_known_under_home);
+  tcase_add_test (tc, test_file_picture_scores);
+  tcase_add_test (tc, test_file_errors);
+  tcase_add_test (tc, test_file_round_trip_with_indexer);
   suite_add_tcase (s, tc);
 
   return s;

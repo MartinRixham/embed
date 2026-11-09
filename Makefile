@@ -16,15 +16,16 @@ MODEL_OBJS = model.o fetch.o tokenizer.o onnx-embed.o ov-embed.o \
 
 all: $(PROGRAMS)
 
-embed-index: embed-index.o common.o $(MODEL_OBJS)
+embed-index: embed-index.o describe.o common.o $(MODEL_OBJS)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS_MODEL) -lmagic
 
-embed-query: embed-query.o common.o $(MODEL_OBJS)
-	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS_MODEL)
+embed-query: embed-query.o describe.o common.o $(MODEL_OBJS)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS_MODEL) -lmagic
 
-common.o embed-index.o embed-query.o fetch.o model.o onnx-embed.o \
-  ov-embed.o tokenizer.o whisper.o: common.h
-embed-index.o embed-query.o model.o: model.h
+common.o describe.o embed-index.o embed-query.o fetch.o model.o \
+  onnx-embed.o ov-embed.o tokenizer.o whisper.o: common.h
+describe.o embed-index.o embed-query.o model.o: model.h
+describe.o embed-index.o embed-query.o: describe.h
 model.o fetch.o: fetch.h
 model.o onnx-embed.o: onnx-embed.h
 model.o ov-embed.o: ov-embed.h
@@ -70,7 +71,8 @@ $(TEST_BUILD)/src-%.o: %.c $(wildcard *.h) | $(TEST_BUILD)
 
 # embed-index with the fake model, for the round trip in test-query.
 $(TEST_BUILD)/embed-index: $(TEST_BUILD)/src-embed-index.o \
-  $(TEST_BUILD)/src-common.o $(TEST_BUILD)/fake-model.o
+  $(TEST_BUILD)/src-describe.o $(TEST_BUILD)/src-common.o \
+  $(TEST_BUILD)/fake-model.o
 	$(CC) $(TEST_CFLAGS) -o $@ $^ -lmagic -lm
 
 $(TEST_BUILD)/test-common: $(TEST_BUILD)/test-common.o $(TEST_SUPPORT)
@@ -93,8 +95,9 @@ $(TEST_BUILD)/test-index: $(TEST_BUILD)/test-index.o \
 	$(CC) $(TEST_CFLAGS) -o $@ $^ $(TEST_LIBS) -lmagic -lutil
 
 $(TEST_BUILD)/test-query: $(TEST_BUILD)/test-query.o \
-  $(TEST_BUILD)/src-common.o $(TEST_BUILD)/fake-model.o $(TEST_SUPPORT)
-	$(CC) $(TEST_CFLAGS) -o $@ $^ $(TEST_LIBS)
+  $(TEST_BUILD)/src-describe.o $(TEST_BUILD)/src-common.o \
+  $(TEST_BUILD)/fake-model.o $(TEST_SUPPORT)
+	$(CC) $(TEST_CFLAGS) -o $@ $^ $(TEST_LIBS) -lmagic
 
 # test-model runs the real ONNX Runtime and OpenVINO, which cannot run
 # under the address sanitizer (OpenVINO loads its threading library
@@ -118,7 +121,7 @@ $(TEST_BUILD)/test-common.o: common.c
 $(TEST_BUILD)/test-tokenizer.o: tokenizer.c
 $(TEST_BUILD)/test-whisper.o: whisper.c
 $(TEST_BUILD)/test-fetch.o: fetch.c
-$(TEST_BUILD)/test-index.o: embed-index.c
+$(TEST_BUILD)/test-index.o: embed-index.c describe.c
 $(TEST_BUILD)/test-query.o: embed-query.c
 $(TEST_BUILD)/plain-test-test-model.o: model.c
 

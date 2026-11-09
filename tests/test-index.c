@@ -1,4 +1,4 @@
-/* test-index.c -- unit tests for embed-index.c.
+/* test-index.c -- unit tests for embed-index.c and describe.c.
    Copyright (C) 2026 Martin Rixham
 
    This program is free software: you can redistribute it and/or modify
@@ -6,7 +6,7 @@
    the Free Software Foundation, either version 3 of the License, or
    (at your option) any later version.
 
-   The file under test is included directly so that its static
+   The files under test are included directly so that their static
    functions can be exercised; its main is renamed so that the tests
    can run it, in a child process, as the real program would run.
 
@@ -17,6 +17,7 @@
 #define main index_main
 #include "../embed-index.c"
 #undef main
+#include "../describe.c"
 
 #include "fake-model.h"
 #include "testutil.h"
