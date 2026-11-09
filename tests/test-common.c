@@ -9,7 +9,7 @@
    The file under test is included directly so that its static
    functions can be exercised.  */
 
-#include "../common.c"
+#include "../src/common.c"
 
 #include "testutil.h"
 

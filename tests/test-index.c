@@ -15,9 +15,9 @@
    is missing.  */
 
 #define main index_main
-#include "../embed-index.c"
+#include "../src/embed-index.c"
 #undef main
-#include "../describe.c"
+#include "../src/describe.c"
 
 #include "fake-model.h"
 #include "testutil.h"

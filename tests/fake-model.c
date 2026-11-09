@@ -7,8 +7,8 @@
    (at your option) any later version.  */
 
 #include "fake-model.h"
-#include "../model.h"
-#include "../common.h"
+#include "../src/model.h"
+#include "../src/common.h"
 
 #include <error.h>
 #include <math.h>

@@ -13,7 +13,7 @@
    espeak-ng and ffmpeg to make speech to transcribe.  The GPU tests are skipped if OpenVINO finds no
    GPU.  Only a few texts are embedded, to keep the machine usable.  */
 
-#include "../model.c"
+#include "../src/model.c"
 
 #include "testutil.h"
 

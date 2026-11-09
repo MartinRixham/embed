@@ -11,8 +11,8 @@
    Reads NUL terminated texts and writes the ids of each, without any
    length limit, on a line of its own.  */
 
-#include "../common.h"
-#include "../tokenizer.h"
+#include "../src/common.h"
+#include "../src/tokenizer.h"
 
 #include <errno.h>
 #include <error.h>

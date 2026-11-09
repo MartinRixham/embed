@@ -11,7 +11,7 @@
    can run it, in a child process, as the real program would run.  */
 
 #define main query_main
-#include "../embed-query.c"
+#include "../src/embed-query.c"
 #undef main
 
 #include "fake-model.h"

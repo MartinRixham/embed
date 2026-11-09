@@ -9,7 +9,7 @@
    These test the parts that need no model: the spectrogram, reading
    the vocabulary and finding loops.  test-model runs the model.  */
 
-#include "../whisper.c"
+#include "../src/whisper.c"
 
 #include "testutil.h"
 

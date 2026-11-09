@@ -18,37 +18,38 @@ GIO_CFLAGS = $(shell pkg-config --cflags gio-2.0)
 GIO_LIBS = $(shell pkg-config --libs gio-2.0)
 
 PROGRAMS = embed-index embed-query embed-search-provider
-MODEL_OBJS = model.o fetch.o tokenizer.o onnx-embed.o ov-embed.o \
-  whisper.o
+MODEL_OBJS = src/model.o src/fetch.o src/tokenizer.o src/onnx-embed.o \
+  src/ov-embed.o src/whisper.o
 
 all: $(PROGRAMS)
 
-embed-index: embed-index.o describe.o common.o $(MODEL_OBJS)
+embed-index: src/embed-index.o src/describe.o src/common.o $(MODEL_OBJS)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS_MODEL) -lmagic
 
-embed-query: embed-query.o search.o describe.o common.o $(MODEL_OBJS)
-	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS_MODEL) -lmagic
-
-embed-search-provider: embed-search-provider.o search.o common.o \
+embed-query: src/embed-query.o src/search.o src/describe.o src/common.o \
   $(MODEL_OBJS)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS_MODEL) -lmagic
+
+embed-search-provider: src/embed-search-provider.o src/search.o \
+  src/common.o $(MODEL_OBJS)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS_MODEL) $(GIO_LIBS)
 
-embed-search-provider.o: embed-search-provider.c
+src/embed-search-provider.o: src/embed-search-provider.c
 	$(CC) $(CPPFLAGS) $(GIO_CFLAGS) $(CFLAGS) -c -o $@ $<
 
-common.o describe.o embed-index.o embed-query.o embed-search-provider.o \
-  fetch.o model.o onnx-embed.o ov-embed.o search.o tokenizer.o \
-  whisper.o: common.h
-describe.o embed-index.o embed-query.o embed-search-provider.o \
-  model.o: model.h
-embed-query.o embed-search-provider.o search.o: search.h
-describe.o embed-index.o embed-query.o: describe.h
-model.o fetch.o: fetch.h
-model.o onnx-embed.o: onnx-embed.h
-model.o ov-embed.o: ov-embed.h
-model.o tokenizer.o: tokenizer.h
-model.o whisper.o: whisper.h
-whisper.o: ov-embed.h
+src/common.o src/describe.o src/embed-index.o src/embed-query.o \
+  src/embed-search-provider.o src/fetch.o src/model.o src/onnx-embed.o \
+  src/ov-embed.o src/search.o src/tokenizer.o src/whisper.o: src/common.h
+src/describe.o src/embed-index.o src/embed-query.o \
+  src/embed-search-provider.o src/model.o: src/model.h
+src/embed-query.o src/embed-search-provider.o src/search.o: src/search.h
+src/describe.o src/embed-index.o src/embed-query.o: src/describe.h
+src/model.o src/fetch.o: src/fetch.h
+src/model.o src/onnx-embed.o: src/onnx-embed.h
+src/model.o src/ov-embed.o: src/ov-embed.h
+src/model.o src/tokenizer.o: src/tokenizer.h
+src/model.o src/whisper.o: src/whisper.h
+src/whisper.o: src/ov-embed.h
 
 SUBST = sed 's|@bindir@|$(bindir)|g'
 
@@ -73,9 +74,10 @@ install: all
 	fi
 
 # A tool for checking the tokenizer by hand.
-tools/tokenize: tools/tokenize.c tokenizer.c common.c tokenizer.h common.h
-	$(CC) $(CPPFLAGS) $(CFLAGS) -I. -o $@ tools/tokenize.c tokenizer.c \
-	  common.c $(shell pkg-config --libs libutf8proc)
+tools/tokenize: tools/tokenize.c src/tokenizer.c src/common.c \
+  src/tokenizer.h src/common.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Isrc -o $@ tools/tokenize.c src/tokenizer.c \
+	  src/common.c $(shell pkg-config --libs libutf8proc)
 
 # Unit tests.  They are built with the address and undefined behaviour
 # sanitizers, in their own directory so as not to mix with the
@@ -88,7 +90,7 @@ TEST_DIR = tests
 TEST_BUILD = $(TEST_DIR)/build
 TEST_CFLAGS = -O1 -g -Wall -Wextra -fno-omit-frame-pointer \
   -fsanitize=address,undefined -fno-sanitize-recover=undefined
-TEST_CPPFLAGS = $(CPPFLAGS) -I. \
+TEST_CPPFLAGS = $(CPPFLAGS) -Isrc \
   -DEMBED_INDEX='"$(abspath $(TEST_BUILD)/embed-index)"' \
   -DTEST_DATA='"$(abspath $(TEST_DIR)/data)"'
 TEST_LIBS = $(shell pkg-config --libs check) $(LDLIBS_MODEL)
@@ -96,12 +98,12 @@ TESTS = test-common test-tokenizer test-whisper test-fetch test-index \
   test-query test-model
 TEST_PROGRAMS = $(addprefix $(TEST_BUILD)/,$(TESTS))
 TEST_SUPPORT = $(TEST_BUILD)/testutil.o $(TEST_BUILD)/fake-http.o
-TEST_HEADERS = $(wildcard $(TEST_DIR)/*.h) $(wildcard *.h)
+TEST_HEADERS = $(wildcard $(TEST_DIR)/*.h) $(wildcard src/*.h)
 
 $(TEST_BUILD)/%.o: $(TEST_DIR)/%.c $(TEST_HEADERS) | $(TEST_BUILD)
 	$(CC) $(TEST_CPPFLAGS) $(TEST_CFLAGS) -c -o $@ $<
 
-$(TEST_BUILD)/src-%.o: %.c $(wildcard *.h) | $(TEST_BUILD)
+$(TEST_BUILD)/src-%.o: src/%.c $(wildcard src/*.h) | $(TEST_BUILD)
 	$(CC) $(TEST_CPPFLAGS) $(TEST_CFLAGS) -c -o $@ $<
 
 # embed-index with the fake model, for the round trip in test-query.
@@ -139,7 +141,7 @@ $(TEST_BUILD)/test-query: $(TEST_BUILD)/test-query.o \
 # with RTLD_DEEPBIND), so it is built without the sanitizers.
 PLAIN_CFLAGS = -O1 -g -Wall -Wextra
 
-$(TEST_BUILD)/plain-%.o: %.c $(wildcard *.h) | $(TEST_BUILD)
+$(TEST_BUILD)/plain-%.o: src/%.c $(wildcard src/*.h) | $(TEST_BUILD)
 	$(CC) $(TEST_CPPFLAGS) $(PLAIN_CFLAGS) -c -o $@ $<
 
 $(TEST_BUILD)/plain-test-%.o: $(TEST_DIR)/%.c $(TEST_HEADERS) | $(TEST_BUILD)
@@ -152,13 +154,13 @@ $(TEST_BUILD)/test-model: $(TEST_BUILD)/plain-test-test-model.o \
 	$(CC) $(PLAIN_CFLAGS) -o $@ $^ $(TEST_LIBS)
 
 # Each test depends on the source file it includes.
-$(TEST_BUILD)/test-common.o: common.c
-$(TEST_BUILD)/test-tokenizer.o: tokenizer.c
-$(TEST_BUILD)/test-whisper.o: whisper.c
-$(TEST_BUILD)/test-fetch.o: fetch.c
-$(TEST_BUILD)/test-index.o: embed-index.c describe.c
-$(TEST_BUILD)/test-query.o: embed-query.c
-$(TEST_BUILD)/plain-test-test-model.o: model.c
+$(TEST_BUILD)/test-common.o: src/common.c
+$(TEST_BUILD)/test-tokenizer.o: src/tokenizer.c
+$(TEST_BUILD)/test-whisper.o: src/whisper.c
+$(TEST_BUILD)/test-fetch.o: src/fetch.c
+$(TEST_BUILD)/test-index.o: src/embed-index.c src/describe.c
+$(TEST_BUILD)/test-query.o: src/embed-query.c
+$(TEST_BUILD)/plain-test-test-model.o: src/model.c
 
 $(TEST_BUILD):
 	mkdir -p $@
@@ -174,7 +176,7 @@ check: $(TEST_PROGRAMS) $(TEST_BUILD)/embed-index
 	exit $$status
 
 clean:
-	rm -f $(PROGRAMS) *.o tools/tokenize
+	rm -f $(PROGRAMS) src/*.o tools/tokenize
 	rm -rf $(TEST_BUILD)
 
 .PHONY: all install check clean

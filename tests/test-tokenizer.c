@@ -10,7 +10,7 @@
    Hugging Face tokenizers library, with nomic-embed-text's
    tokenizer.json; see tools/gen-tokenizer-cases.py.  */
 
-#include "../tokenizer.c"
+#include "../src/tokenizer.c"
 
 #include "testutil.h"
 

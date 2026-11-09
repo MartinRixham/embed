@@ -11,7 +11,7 @@
 /* Give up on a stalled download quickly.  */
 #define STALL_TIMEOUT 2
 
-#include "../fetch.c"
+#include "../src/fetch.c"
 
 #include "testutil.h"
 
