@@ -54,6 +54,7 @@ setup (void)
   setenv ("HOME", fx.home, 1);
   setenv ("FAKE_MODEL_LOG", fx.log, 1);
   unsetenv ("FAKE_MODEL");
+  unsetenv ("FAKE_VISION");
 }
 
 static void
@@ -747,10 +748,17 @@ START_TEST (test_write_record_format)
   struct stat st = { .st_mtime = 1700000000, .st_size = 42 };
   float v[3] = { 0.5f, -0.25f, 1e-7f };
 
-  ck_assert (write_record (f, "/a/b c", &st, v, 3));
+  float pic[3] = { 1, 0, -2 };
+
+  ck_assert (write_record (f, "/a/b c", &st, v, NULL, false, 3));
+  ck_assert (write_record (f, "/d", &st, v, NULL, true, 3));
+  ck_assert (write_record (f, "/e", &st, v, pic, true, 3));
   fclose (f);
-  ck_assert_str_eq (read_file (p), "1700000000 42\t/a/b c\t"
-                    "3f000000be80000033d6bf95\n");
+  ck_assert_str_eq (read_file (p),
+                    "1700000000 42\t/a/b c\t3f000000be80000033d6bf95\n"
+                    "1700000000 42\t/d\t3f000000be80000033d6bf95\t-\n"
+                    "1700000000 42\t/e\t3f000000be80000033d6bf95\t"
+                    "3f80000000000000c0000000\n");
 }
 END_TEST
 
@@ -762,7 +770,7 @@ START_TEST (test_write_record_full_disk)
 
   if (!f)
     return;
-  ck_assert (!write_record (f, "/x", &st, v, 1));
+  ck_assert (!write_record (f, "/x", &st, v, NULL, true, 1));
   fclose (f);
 }
 END_TEST
@@ -843,6 +851,23 @@ START_TEST (test_load_store_dedupes_and_skips_junk)
 }
 END_TEST
 
+START_TEST (test_load_store_picture_field)
+{
+  char model[64];
+
+  write_file (fx.store,
+              "# embed-index model=m dim=1\n"
+              "1 1\t/old\t3f800000\n"
+              "1 1\t/none\t3f800000\t-\n"
+              "1 1\t/pic\t3f800000\t3f800000\n",
+              (size_t) -1);
+  ck_assert (load_store (fx.store, model, sizeof model));
+  ck_assert (!find_entry ("/old")->checked);
+  ck_assert (find_entry ("/none")->checked);
+  ck_assert (find_entry ("/pic")->checked);
+}
+END_TEST
+
 START_TEST (test_load_store_many)
 {
   char model[64];
@@ -889,6 +914,17 @@ START_TEST (test_compact_store)
 }
 END_TEST
 
+START_TEST (test_compact_store_adds_picture_field)
+{
+  write_file (fx.store, "# h\na\tb\tc\nd\te\tf\n", (size_t) -1);
+  keep_push (KEEP_LINE);
+  keep_push (KEEP_NO_PICTURE);
+  keep_push (KEEP_LINE);
+  compact_store (fx.store);
+  ck_assert_str_eq (read_file (fx.store), "# h\na\tb\tc\t-\nd\te\tf\n");
+}
+END_TEST
+
 /* The whole program.  */
 
 START_TEST (test_index_basic)
@@ -931,6 +967,8 @@ START_TEST (test_index_vectors_are_unit_length)
   store = read_file (fx.store);
   line = strchr (store, '\n') + 1;
   line = strchr (strchr (line, '\t') + 1, '\t') + 1;
+  ck_assert_str_eq (line + 8 * FAKE_DIM, "\t-\n");
+  line[8 * FAKE_DIM] = '\0';
   float v[FAKE_DIM];
   double norm = 0;
   ck_assert (parse_hex_vector (line, v, FAKE_DIM));
@@ -1449,6 +1487,376 @@ START_TEST (test_index_options)
 }
 END_TEST
 
+/* Pictures.  */
+
+/* Whether the PICTURE_BYTES of RGB are all close to the colour R, G,
+   B.  */
+static bool
+all_colour (const unsigned char *rgb, int r, int g, int b)
+{
+  for (size_t i = 0; i < PICTURE_BYTES; i += 3)
+    if (abs (rgb[i] - r) > 8 || abs (rgb[i + 1] - g) > 8
+        || abs (rgb[i + 2] - b) > 8)
+      return false;
+  return true;
+}
+
+START_TEST (test_picture_mime)
+{
+  ck_assert (picture_mime ("image/jpeg"));
+  ck_assert (picture_mime ("image/png"));
+  ck_assert (picture_mime ("video/mp4"));
+  ck_assert (!picture_mime ("audio/mpeg"));
+  ck_assert (!picture_mime ("text/plain"));
+  ck_assert (!picture_mime ("application/pdf"));
+}
+END_TEST
+
+START_TEST (test_grab_frame_scales_and_crops)
+{
+  unsigned char *rgb = xmalloc (PICTURE_BYTES);
+  char *p;
+
+  if (!have_program ("ffmpeg"))
+    return;
+  /* Blue, red and green thirds, side by side: the middle square is
+     red.  */
+  shell ("ffmpeg -v quiet -f lavfi -i color=blue:s=300x300 -f lavfi "
+         "-i color=red:s=300x300 -f lavfi -i color=lime:s=300x300 "
+         "-filter_complex hstack=3 -frames:v 1 wide.png");
+  p = home_file ("wide.png");
+  ck_assert (grab_frame (p, -1, rgb));
+  /* The edges of the crop may blend into the neighbours a little, so
+     look at all but the outer columns.  */
+  for (size_t y = 0; y < VISION_SIDE; y++)
+    for (size_t x = 4; x < VISION_SIDE - 4; x++)
+      {
+        unsigned char *px = rgb + 3 * (y * VISION_SIDE + x);
+        ck_assert_msg (px[0] > 240 && px[1] < 16 && px[2] < 16,
+                       "pixel %zu,%zu is %d,%d,%d", x, y, px[0], px[1],
+                       px[2]);
+      }
+  free (p);
+  free (rgb);
+}
+END_TEST
+
+START_TEST (test_grab_frame_small_image)
+{
+  unsigned char *rgb = xmalloc (PICTURE_BYTES);
+  char *p;
+
+  if (!have_program ("ffmpeg"))
+    return;
+  /* Scaled up to fill the square.  */
+  shell ("ffmpeg -v quiet -f lavfi -i color=red:s=16x16 -frames:v 1 "
+         "tiny.png");
+  p = home_file ("tiny.png");
+  ck_assert (grab_frame (p, -1, rgb));
+  ck_assert (all_colour (rgb, 255, 0, 0));
+  free (p);
+  free (rgb);
+}
+END_TEST
+
+START_TEST (test_grab_frame_odd_names)
+{
+  static const char *const names[] = { "-x.png", "a:b.png", "it's.png",
+                                       "sp ace.png" };
+  unsigned char *rgb = xmalloc (PICTURE_BYTES);
+
+  if (!have_program ("ffmpeg"))
+    return;
+  shell ("ffmpeg -v quiet -f lavfi -i color=red:s=64x64 -frames:v 1 "
+         "red.png");
+  for (size_t i = 0; i < sizeof names / sizeof *names; i++)
+    {
+      char *from = home_file ("red.png"), *to = home_file (names[i]);
+
+      ck_assert_int_eq (link (from, to), 0);
+      ck_assert_msg (grab_frame (to, -1, rgb), "%s", names[i]);
+      ck_assert (all_colour (rgb, 255, 0, 0));
+      free (from);
+      free (to);
+    }
+  free (rgb);
+}
+END_TEST
+
+START_TEST (test_grab_frame_not_a_picture)
+{
+  unsigned char *rgb = xmalloc (PICTURE_BYTES);
+  char *p;
+
+  put ("fake.jpg", "this is not a JPEG");
+  p = home_file ("fake.jpg");
+  ck_assert (!grab_frame (p, -1, rgb));
+  free (p);
+  p = home_file ("missing.png");
+  ck_assert (!grab_frame (p, -1, rgb));
+  free (p);
+  free (rgb);
+}
+END_TEST
+
+START_TEST (test_grab_frame_seeks)
+{
+  unsigned char *rgb = xmalloc (PICTURE_BYTES);
+  char *p;
+
+  if (!have_program ("ffmpeg"))
+    return;
+  /* Two seconds of red, then two of blue.  */
+  shell ("ffmpeg -v quiet -f lavfi -i color=red:s=64x64:d=2:r=10 -f lavfi "
+         "-i color=blue:s=64x64:d=2:r=10 -filter_complex concat=n=2 "
+         "-pix_fmt yuv444p clip.mkv");
+  p = home_file ("clip.mkv");
+  ck_assert (grab_frame (p, 0.5, rgb));
+  ck_assert (all_colour (rgb, 255, 0, 0));
+  ck_assert (grab_frame (p, 3.5, rgb));
+  ck_assert (all_colour (rgb, 0, 0, 255));
+  /* Past the end there is nothing.  */
+  ck_assert (!grab_frame (p, 60, rgb));
+  ck_assert_double_eq_tol (video_duration (p), 4.0, 0.2);
+  free (p);
+  free (rgb);
+}
+END_TEST
+
+START_TEST (test_video_duration_unknown)
+{
+  char *p;
+
+  put ("notes.txt", "not a video");
+  p = home_file ("notes.txt");
+  ck_assert_double_lt (video_duration (p), 0);
+  free (p);
+}
+END_TEST
+
+/* The fake vision model's vector for a picture of one colour, with
+   channels from 0 to 1.  */
+static void
+fake_picture_vector (double r, double g, double b, float *v)
+{
+  double norm = 0;
+
+  for (int i = 0; i < FAKE_DIM; i++)
+    {
+      v[i] = 0.05 + (i == 0 ? r : i == 1 ? g : i == 2 ? b : 0);
+      norm += (double) v[i] * v[i];
+    }
+  for (int i = 0; i < FAKE_DIM; i++)
+    v[i] /= sqrt (norm);
+}
+
+START_TEST (test_embed_picture_averages_frames)
+{
+  struct vision *vis = vision_open (false);
+  float *v, half[FAKE_DIM], red[FAKE_DIM], blue[FAKE_DIM];
+  double norm = 0;
+  char *p;
+
+  if (!have_program ("ffmpeg"))
+    return;
+  shell ("ffmpeg -v quiet -f lavfi -i color=red:s=64x64:d=2:r=10 -f lavfi "
+         "-i color=blue:s=64x64:d=2:r=10 -filter_complex concat=n=2 "
+         "-pix_fmt yuv444p clip.mkv");
+  p = home_file ("clip.mkv");
+  v = embed_picture (vis, p, "video/x-matroska", FAKE_DIM);
+  ck_assert_ptr_nonnull (v);
+  /* Half the frames are red and half blue.  */
+  fake_picture_vector (1, 0, 0, red);
+  fake_picture_vector (0, 0, 1, blue);
+  for (int i = 0; i < FAKE_DIM; i++)
+    {
+      half[i] = red[i] + blue[i];
+      norm += (double) half[i] * half[i];
+    }
+  for (int i = 0; i < FAKE_DIM; i++)
+    ck_assert_double_eq_tol (v[i], half[i] / sqrt (norm), 0.01);
+  free (v);
+
+  /* An image is one picture.  */
+  shell ("ffmpeg -v quiet -f lavfi -i color=lime:s=64x64 -frames:v 1 "
+         "green.png");
+  free (p);
+  p = home_file ("green.png");
+  v = embed_picture (vis, p, "image/png", FAKE_DIM);
+  ck_assert_ptr_nonnull (v);
+  fake_picture_vector (0, 1, 0, half);
+  for (int i = 0; i < FAKE_DIM; i++)
+    ck_assert_double_eq_tol (v[i], half[i], 0.01);
+  free (v);
+  free (p);
+
+  /* Something that cannot be decoded has no picture.  */
+  put ("fake.mp4", "not a video");
+  p = home_file ("fake.mp4");
+  ck_assert_ptr_null (embed_picture (vis, p, "video/mp4", FAKE_DIM));
+  free (p);
+  vision_close (vis);
+}
+END_TEST
+
+/* Return the store's record for HOME/NAME, freshly allocated, without
+   its newline, or NULL.  */
+static char *
+record_of (const char *name)
+{
+  char *store = read_file (fx.store), *needle, *start, *end;
+
+  if (asprintf (&needle, "\t%s/%s\t", fx.home, name) < 0)
+    abort ();
+  start = store ? strstr (store, needle) : NULL;
+  free (needle);
+  if (!start)
+    return NULL;
+  while (start > store && start[-1] != '\n')
+    start--;
+  end = strchr (start, '\n');
+  return strndup (start, end - start);
+}
+
+/* Return the picture field of the record for HOME/NAME, or NULL if it
+   has none.  */
+static char *
+picture_field (const char *name)
+{
+  char *rec = record_of (name), *p;
+
+  ck_assert_ptr_nonnull (rec);
+  p = strchr (rec, '\t');
+  p = strchr (p + 1, '\t');
+  p = strchr (p + 1, '\t');
+  return p ? p + 1 : NULL;
+}
+
+START_TEST (test_index_pictures)
+{
+  float v[FAKE_DIM], expect[FAKE_DIM];
+
+  if (!have_program ("ffmpeg"))
+    return;
+  put ("notes.txt", "alpha");
+  shell ("ffmpeg -v quiet -f lavfi -i color=red:s=64x64 -frames:v 1 "
+         "red.png");
+  shell ("ffmpeg -v quiet -f lavfi -i color=blue:s=64x64:d=2:r=5 "
+         "-pix_fmt yuv444p blue.mkv");
+  put ("broken.png", "not a picture");
+  ck_assert_int_eq (run_index (NULL), 0);
+  ck_assert_ptr_nonnull (strstr (err_text (), "embedded 4, unchanged 0, "
+                                 "failed 0"));
+
+  ck_assert_str_eq (picture_field ("notes.txt"), "-");
+  ck_assert_str_eq (picture_field ("broken.png"), "-");
+  ck_assert (parse_hex_vector (picture_field ("red.png"), v, FAKE_DIM));
+  fake_picture_vector (1, 0, 0, expect);
+  for (int i = 0; i < FAKE_DIM; i++)
+    ck_assert_double_eq_tol (v[i], expect[i], 0.01);
+  ck_assert (parse_hex_vector (picture_field ("blue.mkv"), v, FAKE_DIM));
+  fake_picture_vector (0, 0, 1, expect);
+  for (int i = 0; i < FAKE_DIM; i++)
+    ck_assert_double_eq_tol (v[i], expect[i], 0.01);
+
+  /* The text is embedded as before.  */
+  ck_assert_uint_eq (requests (), 5);
+}
+END_TEST
+
+START_TEST (test_index_upgrades_old_store)
+{
+  char *store, *line;
+  struct stat st;
+  FILE *f;
+
+  if (!have_program ("ffmpeg"))
+    return;
+  put ("notes.txt", "alpha");
+  shell ("ffmpeg -v quiet -f lavfi -i color=red:s=64x64 -frames:v 1 "
+         "red.png");
+  ck_assert_int_eq (run_index (NULL), 0);
+
+  /* Make it look as if it was written before pictures were embedded,
+     dropping the last field of each record.  */
+  store = read_file (fx.store);
+  f = fopen (fx.store, "w");
+  for (line = strtok (store, "\n"); line; line = strtok (NULL, "\n"))
+    {
+      char *tab = strchr (line, '\t');
+      if (tab && (tab = strchr (tab + 1, '\t'))
+          && (tab = strchr (tab + 1, '\t')))
+        *tab = '\0';
+      fprintf (f, "%s\n", line);
+    }
+  fclose (f);
+  ck_assert_ptr_null (picture_field ("notes.txt"));
+  ck_assert_ptr_null (picture_field ("red.png"));
+  char *old_notes = record_of ("notes.txt");
+
+  /* The text file is only marked, and the picture embedded again.  */
+  truncate (fx.log, 0);
+  ck_assert_int_eq (run_index (NULL), 0);
+  ck_assert_ptr_nonnull (strstr (err_text (), "embedded 1, unchanged 1"));
+  ck_assert_uint_eq (count_substr (read_file (fx.log), "notes.txt"), 0);
+  ck_assert_uint_eq (count_substr (read_file (fx.log), "red.png"), 1);
+  ck_assert_uint_eq (record_count (), 2);
+  ck_assert_str_eq (picture_field ("notes.txt"), "-");
+  ck_assert (strncmp (record_of ("notes.txt"), old_notes,
+                      strlen (old_notes)) == 0);
+  ck_assert_str_ne (picture_field ("red.png"), "-");
+
+  /* After which there is nothing to do.  */
+  ck_assert_int_eq (stat (fx.store, &st), 0);
+  store = read_file (fx.store);
+  ck_assert_int_eq (run_index (NULL), 0);
+  ck_assert_ptr_nonnull (strstr (err_text (), "embedded 0, unchanged 2"));
+  ck_assert_str_eq (read_file (fx.store), store);
+}
+END_TEST
+
+START_TEST (test_index_without_vision_model)
+{
+  if (!have_program ("ffmpeg"))
+    return;
+  put ("notes.txt", "alpha");
+  shell ("ffmpeg -v quiet -f lavfi -i color=red:s=64x64 -frames:v 1 "
+         "red.png");
+  shell ("ffmpeg -v quiet -f lavfi -i color=blue:s=64x64 -frames:v 1 "
+         "blue.png");
+  setenv ("FAKE_VISION", "fail", 1);
+  ck_assert_int_eq (run_index (NULL), 0);
+  /* Said once, and the pictures are still indexed by their text.  */
+  ck_assert_uint_eq (count_substr (err_text (), "cannot open the "
+                                   VISION_MODEL), 1);
+  ck_assert_ptr_nonnull (strstr (err_text (), "embedded 3, unchanged 0, "
+                                 "failed 0"));
+  ck_assert_str_eq (picture_field ("notes.txt"), "-");
+  ck_assert_ptr_null (picture_field ("red.png"));
+
+  /* Still missing: nothing is embedded again.  */
+  ck_assert_int_eq (run_index (NULL), 0);
+  ck_assert_ptr_nonnull (strstr (err_text (), "embedded 0, unchanged 3"));
+
+  /* Once it is there, the pictures are done.  */
+  unsetenv ("FAKE_VISION");
+  ck_assert_int_eq (run_index (NULL), 0);
+  ck_assert_ptr_nonnull (strstr (err_text (), "embedded 2, unchanged 1"));
+  ck_assert_str_ne (picture_field ("red.png"), "-");
+  ck_assert_str_ne (picture_field ("blue.png"), "-");
+}
+END_TEST
+
+START_TEST (test_index_vision_model_only_when_needed)
+{
+  put ("notes.txt", "alpha");
+  setenv ("FAKE_VISION", "fail", 1);
+  ck_assert_int_eq (run_index (NULL), 0);
+  /* No pictures, so no attempt to open it.  */
+  ck_assert_ptr_null (strstr (err_text (), VISION_MODEL));
+}
+END_TEST
+
 static Suite *
 index_suite (void)
 {
@@ -1497,6 +1905,23 @@ index_suite (void)
   tcase_add_test (tc, test_describe_pdf_type);
   suite_add_tcase (s, tc);
 
+  tc = tcase_create ("pictures");
+  tcase_add_checked_fixture (tc, setup, teardown);
+  tcase_set_timeout (tc, 60);
+  tcase_add_test (tc, test_picture_mime);
+  tcase_add_test (tc, test_grab_frame_scales_and_crops);
+  tcase_add_test (tc, test_grab_frame_small_image);
+  tcase_add_test (tc, test_grab_frame_odd_names);
+  tcase_add_test (tc, test_grab_frame_not_a_picture);
+  tcase_add_test (tc, test_grab_frame_seeks);
+  tcase_add_test (tc, test_video_duration_unknown);
+  tcase_add_test (tc, test_embed_picture_averages_frames);
+  tcase_add_test (tc, test_index_pictures);
+  tcase_add_test (tc, test_index_upgrades_old_store);
+  tcase_add_test (tc, test_index_without_vision_model);
+  tcase_add_test (tc, test_index_vision_model_only_when_needed);
+  suite_add_tcase (s, tc);
+
   tc = tcase_create ("store");
   tcase_add_checked_fixture (tc, setup, teardown);
   tcase_add_test (tc, test_keep_push_grows);
@@ -1507,8 +1932,10 @@ index_suite (void)
   tcase_add_exit_test (tc, test_load_store_empty_file, EXIT_FAILURE);
   tcase_add_test (tc, test_load_store_header_only);
   tcase_add_test (tc, test_load_store_dedupes_and_skips_junk);
+  tcase_add_test (tc, test_load_store_picture_field);
   tcase_add_test (tc, test_load_store_many);
   tcase_add_test (tc, test_compact_store);
+  tcase_add_test (tc, test_compact_store_adds_picture_field);
   suite_add_tcase (s, tc);
 
   tc = tcase_create ("program");

@@ -1,4 +1,4 @@
-/* onnx-embed.c -- run a BERT-style embedding model with ONNX Runtime.
+/* onnx-embed.c -- run embedding models with ONNX Runtime.
    Copyright (C) 2026 Martin Rixham
 
    This program is free software: you can redistribute it and/or modify
@@ -35,6 +35,21 @@ failed (const OrtApi *api, OrtStatus *status, const char *what)
   error (0, 0, "%s: %s", what, api->GetErrorMessage (status));
   api->ReleaseStatus (status);
   return true;
+}
+
+/* Scale the DIM floats of V to unit length, unless they are all
+   zero.  */
+static void
+unit_length (float *v, size_t dim)
+{
+  double norm = 0;
+
+  for (size_t d = 0; d < dim; d++)
+    norm += (double) v[d] * v[d];
+  norm = sqrt (norm);
+  if (norm > 0)
+    for (size_t d = 0; d < dim; d++)
+      v[d] /= norm;
 }
 
 struct onnx_model *
@@ -135,7 +150,6 @@ onnx_embed (struct onnx_model *m, const int64_t *ids, size_t n,
   size_t n_dims;
   float *hidden, *v = NULL;
   bool ok = false;
-  double norm = 0;
 
   for (size_t i = 0; i < n; i++)
     {
@@ -192,12 +206,8 @@ onnx_embed (struct onnx_model *m, const int64_t *ids, size_t n,
       for (size_t t = 0; t < n; t++)
         sum += hidden[t * *dim + d];
       v[d] = sum / n;
-      norm += (double) v[d] * v[d];
     }
-  norm = sqrt (norm);
-  if (norm > 0)
-    for (size_t d = 0; d < *dim; d++)
-      v[d] /= norm;
+  unit_length (v, *dim);
   *vec = v;
   ok = true;
 
@@ -212,5 +222,71 @@ onnx_embed (struct onnx_model *m, const int64_t *ids, size_t n,
   free (inputs);
   free (ones);
   free (zeros);
+  return ok;
+}
+
+bool
+onnx_embed_image (struct onnx_model *m, const float *pixels, size_t side,
+                  float **vec, size_t *dim)
+{
+  const OrtApi *api = m->api;
+  int64_t shape[4] = { 1, 3, (int64_t) side, (int64_t) side };
+  OrtValue *input = NULL, *output = NULL;
+  OrtTensorTypeAndShapeInfo *info = NULL;
+  ONNXTensorElementDataType type;
+  int64_t out_shape[3];
+  size_t n_dims;
+  float *hidden, *v;
+  bool ok = false;
+
+  if (m->n_inputs != 1)
+    {
+      error (0, 0, "the image model should have one input, not %zu",
+             m->n_inputs);
+      return false;
+    }
+  if (failed (api, api->CreateTensorWithDataAsOrtValue
+              (m->memory, (void *) pixels, 3 * side * side * sizeof *pixels,
+               shape, 4, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &input),
+              "cannot make input tensor")
+      || failed (api, api->Run (m->session, NULL,
+                                (const char *const *) m->input_names,
+                                (const OrtValue *const *) &input, 1,
+                                (const char *const *) &m->output_name, 1,
+                                &output), "cannot run model")
+      || failed (api, api->GetTensorTypeAndShape (output, &info),
+                 "output shape")
+      || failed (api, api->GetDimensionsCount (info, &n_dims),
+                 "output shape"))
+    goto out;
+  if (failed (api, api->GetTensorElementType (info, &type), "output type")
+      || type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT
+      || n_dims != 3
+      || failed (api, api->GetDimensions (info, out_shape, 3),
+                 "output shape")
+      || out_shape[0] != 1 || out_shape[1] <= 0 || out_shape[2] <= 0)
+    {
+      error (0, 0, "unexpected output type or shape from the model");
+      goto out;
+    }
+  if (failed (api, api->GetTensorMutableData (output, (void **) &hidden),
+              "output data"))
+    goto out;
+
+  /* The first token's state, at unit length.  */
+  *dim = out_shape[2];
+  v = xmalloc (*dim * sizeof *v);
+  memcpy (v, hidden, *dim * sizeof *v);
+  unit_length (v, *dim);
+  *vec = v;
+  ok = true;
+
+ out:
+  if (info)
+    api->ReleaseTensorTypeAndShapeInfo (info);
+  if (output)
+    api->ReleaseValue (output);
+  if (input)
+    api->ReleaseValue (input);
   return ok;
 }

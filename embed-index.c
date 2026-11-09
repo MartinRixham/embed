@@ -10,8 +10,17 @@
    location, type and, where possible, its content: plain text, PDF
    text, office document text, OCR of images, or audio/video metadata)
    and that text is embedded by nomic-embed-text, running on the GPU if
-   there is a usable one.  The results are appended to
-   ~/.local/share/embed/embeddings.txt, one file per line.
+   there is a usable one.  Images and videos are also embedded by what
+   they show: nomic-embed-vision embeds an image, or a few frames of a
+   video, into the same space as the text, from pixels that ffmpeg
+   decodes.  The results are appended to
+   ~/.local/share/embed/embeddings.txt, one file per line:
+
+     MTIME SIZE <tab> PATH <tab> TEXT-VECTOR [<tab> PICTURE-VECTOR]
+
+   where the picture vector is "-" for a file that has none.  Records
+   from before pictures were embedded lack the last field; such files
+   are checked again, and embedded again if they are pictures.
    Files whose size and modification time are unchanged since the last
    run are skipped, so the program can be rerun cheaply.  */
 
@@ -22,6 +31,7 @@
 #include <error.h>
 #include <fcntl.h>
 #include <fts.h>
+#include <math.h>
 #include <getopt.h>
 #include <magic.h>
 #include <signal.h>
@@ -35,6 +45,13 @@
 /* How much file content to feed the model, in bytes.  */
 #define MAX_CONTENT 1500
 
+/* How many frames of a video to embed; their average stands for the
+   video.  */
+#define VIDEO_FRAMES 8
+
+/* Bytes in a picture for the vision model.  */
+#define PICTURE_BYTES (3 * VISION_SIDE * VISION_SIDE)
+
 /* An entry loaded from an existing store.  */
 struct entry
 {
@@ -43,13 +60,16 @@ struct entry
   long long size;
   size_t line;                  /* Line number of the newest record.  */
   bool seen;                    /* Found during this run's walk.  */
+  bool checked;                 /* The record has a picture field.  */
 };
 
 static struct entry *entries;
 static size_t n_entries;
 
 /* KEEP[N] is nonzero if line N of the store should survive
-   compaction.  */
+   compaction: KEEP_LINE to keep it as it is, KEEP_NO_PICTURE to add
+   an empty picture field to it.  */
+enum { KEEP_LINE = 1, KEEP_NO_PICTURE = 2 };
 static char *keep;
 static size_t n_lines, keep_cap;
 
@@ -61,6 +81,10 @@ static bool verbose;
 static bool include_hidden;
 static bool use_cpu;
 static long helper_timeout = 2;
+
+/* The vision model, opened when the first picture needs it.  */
+static struct vision *vision;
+static bool vision_tried;
 
 static struct option const long_options[] = {
   {"all", no_argument, NULL, 'a'},
@@ -81,7 +105,9 @@ usage (int status)
     }
   printf ("Usage: embed-index [OPTION]... [DIRECTORY]...\n"
           "Embed every file under each DIRECTORY (default: $HOME) with "
-          "the local\nmodel %s, which is downloaded if it is missing.\n\n"
+          "the local\nmodel %s, which is downloaded if it is missing.\n"
+          "Images and videos are also embedded by what they show, with "
+          "%s.\n\n"
           "  -a, --all            include hidden files and directories\n"
           "      --cpu            run the model on the CPU even if there is "
           "a GPU\n"
@@ -89,7 +115,7 @@ usage (int status)
           "      --help           display this help and exit\n"
           "      --version        output version information and exit\n\n"
           "Embeddings are stored in ~/.local/share/embed/embeddings.txt.\n",
-          EMBED_MODEL);
+          EMBED_MODEL, VISION_MODEL);
   exit (status);
 }
 
@@ -191,6 +217,7 @@ load_store (const char *path, char *model, size_t model_size)
       entries[n_entries].size = size;
       entries[n_entries].line = n_lines - 1;
       entries[n_entries].seen = false;
+      entries[n_entries].checked = strchr (tab2 + 1, '\t') != NULL;
       n_entries++;
     }
   free (line);
@@ -221,7 +248,7 @@ load_store (const char *path, char *model, size_t model_size)
 static void
 run_capture (const char *const *argv, struct buf *out, size_t max)
 {
-  const char *args[16];
+  const char *args[32];
   char limit[32];
   int fds[2];
   pid_t pid;
@@ -232,7 +259,7 @@ run_capture (const char *const *argv, struct buf *out, size_t max)
   args[1] = "-k";
   args[2] = "1";
   args[3] = limit;
-  for (i = 0; argv[i] && i < 11; i++)
+  for (i = 0; argv[i] && i < 27; i++)
     args[i + 4] = argv[i];
   args[i + 4] = NULL;
 
@@ -411,6 +438,168 @@ extract_content (const char *file, const char *mime, struct buf *out)
     }
 }
 
+/* Whether a file of type MIME can be embedded by what it shows.  */
+static bool
+picture_mime (const char *mime)
+{
+  return starts_with (mime, "image/") || starts_with (mime, "video/");
+}
+
+/* Return the MIME type of FILE, freshly allocated, or NULL.  */
+static char *
+file_mime (magic_t magic_mime, const char *file)
+{
+  const char *mime = magic_file (magic_mime, file);
+  return mime ? xstrdup (mime) : NULL;
+}
+
+/* Decode one frame of FILE, from AT seconds in if AT is not negative,
+   scaled and cropped to the middle square for the vision model, into
+   the PICTURE_BYTES of RGB.  The scaling is done as for CLIP: the
+   shorter side is scaled to VISION_SIDE, with bicubic filtering.  */
+static bool
+grab_frame (const char *file, double at, unsigned char *rgb)
+{
+  char filter[160], seek[32];
+  struct buf url, out;
+  const char *argv[24];
+  size_t n = 0;
+  bool ok;
+
+  snprintf (filter, sizeof filter,
+            "scale=%d:%d:force_original_aspect_ratio=increase"
+            ":flags=bicubic,crop=%d:%d", VISION_SIDE, VISION_SIDE,
+            VISION_SIDE, VISION_SIDE);
+  snprintf (seek, sizeof seek, "%.3f", at);
+  /* The file: protocol, so that ffmpeg reads FILE as a file whatever
+     its name looks like.  */
+  buf_init (&url);
+  buf_puts (&url, "file:");
+  buf_puts (&url, file);
+
+  argv[n++] = "ffmpeg";
+  argv[n++] = "-nostdin";
+  argv[n++] = "-v";
+  argv[n++] = "quiet";
+  if (at >= 0)
+    {
+      argv[n++] = "-ss";
+      argv[n++] = seek;
+    }
+  argv[n++] = "-i";
+  argv[n++] = url.data;
+  argv[n++] = "-an";
+  argv[n++] = "-frames:v";
+  argv[n++] = "1";
+  argv[n++] = "-vf";
+  argv[n++] = filter;
+  argv[n++] = "-f";
+  argv[n++] = "rawvideo";
+  argv[n++] = "-pix_fmt";
+  argv[n++] = "rgb24";
+  argv[n++] = "-";
+  argv[n] = NULL;
+
+  buf_init (&out);
+  run_capture (argv, &out, PICTURE_BYTES + 1);
+  ok = out.len == PICTURE_BYTES;
+  if (ok)
+    memcpy (rgb, out.data, PICTURE_BYTES);
+  buf_free (&out);
+  buf_free (&url);
+  return ok;
+}
+
+/* Return the length of the video FILE in seconds, or a negative
+   number if it is unknown.  */
+static double
+video_duration (const char *file)
+{
+  const char *argv[] = { "ffprobe", "-v", "quiet", "-show_entries",
+                         "format=duration", "-of", "default=nw=1:nk=1",
+                         file, NULL };
+  struct buf out;
+  double d;
+  char *end;
+
+  buf_init (&out);
+  run_capture (argv, &out, 64);
+  d = strtod (out.data, &end);
+  if (end == out.data || !(d > 0) || d > 1e9)
+    d = -1;
+  buf_free (&out);
+  return d;
+}
+
+/* Return the vision model, opening it if this is the first time it is
+   needed, or NULL if it cannot be opened.  */
+static struct vision *
+get_vision (void)
+{
+  if (!vision_tried)
+    {
+      vision_tried = true;
+      vision = vision_open (!use_cpu);
+      if (!vision)
+        error (0, 0, "cannot open the %s model; images and videos will "
+               "be indexed by their text alone", VISION_MODEL);
+    }
+  return vision;
+}
+
+/* Embed what FILE, of type MIME, shows: the picture, if it is an
+   image, or the average of a few frames spread through it, if it is a
+   video.  Return a freshly allocated unit vector of DIM floats, or
+   NULL if FILE cannot be decoded.  */
+static float *
+embed_picture (struct vision *vis, const char *file, const char *mime,
+               size_t dim)
+{
+  bool video = starts_with (mime, "video/");
+  double duration = video ? video_duration (file) : -1;
+  size_t n_frames = duration > 0 ? VIDEO_FRAMES : 1, got = 0;
+  unsigned char *rgb = xmalloc (PICTURE_BYTES);
+  float *sum = xmalloc (dim * sizeof *sum);
+  double norm = 0;
+
+  memset (sum, 0, dim * sizeof *sum);
+  for (size_t i = 0; i < n_frames && !interrupted; i++)
+    {
+      /* Frames from the middle of equal slices, avoiding the very
+         start and end, which are often black.  */
+      double at = duration > 0 ? duration * (i + 0.5) / n_frames : -1;
+      float *vec;
+      size_t d;
+
+      if (!grab_frame (file, at, rgb) || !vision_embed (vis, rgb, &vec, &d))
+        continue;
+      if (d != dim)
+        {
+          error (0, 0, "%s model returned %zu dimensions instead of %zu",
+                 VISION_MODEL, d, dim);
+          free (vec);
+          break;
+        }
+      for (size_t j = 0; j < dim; j++)
+        sum[j] += vec[j];
+      free (vec);
+      got++;
+    }
+  free (rgb);
+
+  for (size_t j = 0; j < dim; j++)
+    norm += (double) sum[j] * sum[j];
+  if (got == 0 || norm == 0)
+    {
+      free (sum);
+      return NULL;
+    }
+  norm = sqrt (norm);
+  for (size_t j = 0; j < dim; j++)
+    sum[j] /= norm;
+  return sum;
+}
+
 /* Build the text that represents FILE for the model, in OUT.  HOME is
    used to shorten the displayed location.  */
 static void
@@ -462,14 +651,26 @@ embed_checked (struct model *m, const char *text, size_t dim, float **vec)
   return false;
 }
 
-/* Write a store record for FILE to F and return true on success.  */
+/* Write a store record for FILE to F and return true on success.  VEC
+   is the embedding of its text, and PICTURE that of what it shows, if
+   anything.  Unless CHECKED, leave out the picture field, so that the
+   file will be looked at again: the picture could not be embedded,
+   though it might be one.  */
 static bool
 write_record (FILE *f, const char *file, const struct stat *st,
-              const float *vec, size_t dim)
+              const float *vec, const float *picture, bool checked,
+              size_t dim)
 {
   fprintf (f, "%lld %lld\t%s\t", (long long) st->st_mtime,
            (long long) st->st_size, file);
   write_hex_vector (f, vec, dim);
+  if (picture)
+    {
+      putc ('\t', f);
+      write_hex_vector (f, picture, dim);
+    }
+  else if (checked)
+    fputs ("\t-", f);
   putc ('\n', f);
   return fflush (f) == 0 && !ferror (f);
 }
@@ -512,7 +713,15 @@ compact_store (const char *path)
   while ((len = getline (&line, &line_size, in)) > 0)
     {
       if (n < n_lines && keep[n] && line[len - 1] == '\n')
-        fwrite (line, 1, len, out);
+        {
+          if (keep[n] == KEEP_NO_PICTURE)
+            {
+              fwrite (line, 1, len - 1, out);
+              fputs ("\t-\n", out);
+            }
+          else
+            fwrite (line, 1, len, out);
+        }
       n++;
     }
   free (line);
@@ -646,6 +855,9 @@ main (int argc, char **argv)
     {
       struct entry *e;
       struct buf text;
+      char *mime = NULL;
+      float *picture = NULL;
+      bool checked;
 
       if (ent->fts_level > 0 && ent->fts_name[0] == '.' && !include_hidden)
         {
@@ -669,8 +881,25 @@ main (int argc, char **argv)
           if (e->mtime == ent->fts_statp->st_mtime
               && e->size == ent->fts_statp->st_size && dim > 0)
             {
-              n_same++;
-              continue;
+              /* A record from before pictures were embedded needs
+                 doing again if the file is a picture, and only marking
+                 as checked otherwise.  */
+              if (!e->checked)
+                mime = file_mime (magic_mime, ent->fts_path);
+              if (e->checked || !mime
+                  || (picture_mime (mime) && !get_vision ()))
+                {
+                  free (mime);
+                  n_same++;
+                  continue;
+                }
+              if (!picture_mime (mime))
+                {
+                  keep[e->line] = KEEP_NO_PICTURE;
+                  free (mime);
+                  n_same++;
+                  continue;
+                }
             }
         }
 
@@ -693,13 +922,32 @@ main (int argc, char **argv)
 
       if (!ok)
         {
+          free (mime);
           n_failed++;
           error (0, 0, "%s: could not embed", ent->fts_path);
           continue;
         }
-      if (!write_record (out, ent->fts_path, ent->fts_statp, vec, dim))
+
+      if (!mime)
+        mime = file_mime (magic_mime, ent->fts_path);
+      checked = mime != NULL;
+      if (mime && picture_mime (mime))
+        {
+          struct vision *vis = get_vision ();
+
+          if (vis)
+            picture = embed_picture (vis, ent->fts_path, mime, dim);
+          /* Try again next time if the model is missing, or this run
+             was interrupted in the middle of the file.  */
+          checked = vis && !interrupted;
+        }
+      free (mime);
+
+      if (!write_record (out, ent->fts_path, ent->fts_statp, vec, picture,
+                         checked, dim))
         error (EXIT_FAILURE, errno, "%s", store);
       free (vec);
+      free (picture);
 
       if (e)
         {
@@ -716,6 +964,7 @@ main (int argc, char **argv)
     fputc ('\n', stderr);
   fts_close (fts);
   model_close (model);
+  vision_close (vision);
   if (fclose (out) != 0)
     error (EXIT_FAILURE, errno, "%s", store);
 

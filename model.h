@@ -1,4 +1,4 @@
-/* model.h -- the embedding model, nomic-embed-text v1.5.
+/* model.h -- the embedding models, nomic-embed-text and -vision v1.5.
    Copyright (C) 2026 Martin Rixham
 
    This program is free software: you can redistribute it and/or modify
@@ -6,7 +6,7 @@
    the Free Software Foundation, either version 3 of the License, or
    (at your option) any later version.
 
-   The programs use the model only through these functions, so that
+   The programs use the models only through these functions, so that
    the tests can link a fake model in its place.  */
 
 #ifndef EMBED_MODEL_H
@@ -32,5 +32,22 @@ const char *model_device (const struct model *m);
    and return true.  */
 bool model_embed (struct model *m, const char *text, float **vec,
                   size_t *dim);
+
+/* The image model, which embeds pictures into the same space as the
+   text model, so that a text query can find them.  */
+struct vision;
+
+/* Images are given to vision_embed this many pixels square.  */
+#define VISION_SIDE 224
+
+/* Open the image model like model_open.  */
+struct vision *vision_open (bool use_gpu);
+void vision_close (struct vision *v);
+
+/* Embed the picture RGB: VISION_SIDE rows of VISION_SIDE pixels, each
+   three bytes of red, green and blue.  Return the vector like
+   model_embed.  */
+bool vision_embed (struct vision *v, const unsigned char *rgb, float **vec,
+                   size_t *dim);
 
 #endif /* EMBED_MODEL_H */

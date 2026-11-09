@@ -9,17 +9,37 @@
    The query is embedded on the CPU, which for a single short text is
    quicker than starting up the GPU, by the model that built the store,
    and the store is scanned, keeping the best matches by cosine
-   similarity.  */
+   similarity.  A file with a picture vector, from an image or video,
+   scores the better of its text and its picture.
+
+   Pictures are compared with the query as Nomic's vision model
+   expects: after a layer norm of the text model's output, which, since
+   both vectors are of unit length, comes to taking out the query's
+   mean.  Text queries match pictures with much lower cosines than they
+   match texts, and over a narrower range: a picture of what the query
+   names scores about 0.1 and others 0.01 to 0.05, while texts score
+   about 0.45 when unrelated and 0.6 to 0.75 when they match.  So
+   picture scores are mapped linearly onto the text scale.  */
 
 #include "common.h"
 #include "model.h"
 
 #include <errno.h>
+#include <math.h>
 #include <error.h>
 #include <getopt.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* How the cosine between a query and a picture is put on the scale
+   of text scores; see above.  */
+#ifndef PICTURE_SCALE
+#define PICTURE_SCALE 2.5
+#endif
+#ifndef PICTURE_OFFSET
+#define PICTURE_OFFSET 0.40
+#endif
 
 struct match
 {
@@ -99,10 +119,12 @@ compare_paths (const void *a, const void *b)
 }
 
 /* If LINE, of LEN bytes, is a complete record, end its path with a NUL
-   and return the path; store the start of its vector in *VEC.
+   and return the path; store the start of its vector in *VEC.  If
+   PICTURE is not NULL, end the vector with a NUL too and store in
+   *PICTURE the start of the picture vector, or NULL if there is none.
    Otherwise return NULL.  */
 static char *
-split_record (char *line, ssize_t len, char **vec)
+split_record (char *line, ssize_t len, char **vec, char **picture)
 {
   char *path, *p;
 
@@ -117,6 +139,16 @@ split_record (char *line, ssize_t len, char **vec)
     return NULL;
   *p = '\0';
   *vec = p + 1;
+  if (picture)
+    {
+      *picture = NULL;
+      if ((p = strchr (*vec, '\t')))
+        {
+          *p = '\0';
+          if (p[1] != '-')
+            *picture = p + 1;
+        }
+    }
   return path;
 }
 
@@ -135,7 +167,7 @@ find_latest (FILE *f, size_t *n)
   while ((len = getline (&line, &line_size, f)) > 0)
     {
       line_no++;
-      if (!(path = split_record (line, len, &vec)))
+      if (!(path = split_record (line, len, &vec, NULL)))
         continue;
       if (used == cap)
         {
@@ -180,7 +212,8 @@ main (int argc, char **argv)
   struct latest *latest;
   size_t n_latest;
   long data_start;
-  float *qvec, *vec;
+  float *qvec, *pvec, *vec;
+  double qmean = 0, qnorm = 0;
   FILE *f;
   int c;
 
@@ -243,6 +276,20 @@ main (int argc, char **argv)
     error (EXIT_FAILURE, 0, "query has dimension %zu but store has %zu",
            qdim, dim);
 
+  /* The query as compared with pictures.  */
+  pvec = xmalloc (dim * sizeof *pvec);
+  for (size_t i = 0; i < dim; i++)
+    qmean += qvec[i];
+  qmean /= dim;
+  for (size_t i = 0; i < dim; i++)
+    {
+      pvec[i] = qvec[i] - qmean;
+      qnorm += (double) pvec[i] * pvec[i];
+    }
+  qnorm = sqrt (qnorm);
+  for (size_t i = 0; i < dim; i++)
+    pvec[i] = qnorm > 0 ? pvec[i] / qnorm : 0;
+
   /* A path can have several records, if an interrupted indexing run
      left them, or one is in progress: only the newest counts.  Find
      those first, so that a stale record cannot take the place of a
@@ -258,10 +305,10 @@ main (int argc, char **argv)
        (len = getline (&line, &line_size, f)) > 0; line_no++)
     {
       struct latest key, *newest;
-      char *path, *p;
+      char *path, *p, *picture;
       double dot = 0;
 
-      if (!(path = split_record (line, len, &p)))
+      if (!(path = split_record (line, len, &p, &picture)))
         continue;
       key.path = path;
       newest = n_latest ? bsearch (&key, latest, n_latest, sizeof *latest,
@@ -273,6 +320,16 @@ main (int argc, char **argv)
         continue;
       for (size_t i = 0; i < dim; i++)
         dot += (double) vec[i] * qvec[i];
+      if (picture && parse_hex_vector (picture, vec, dim))
+        {
+          double pdot = 0;
+
+          for (size_t i = 0; i < dim; i++)
+            pdot += (double) vec[i] * pvec[i];
+          pdot = PICTURE_OFFSET + PICTURE_SCALE * pdot;
+          if (pdot > dot)
+            dot = pdot;
+        }
       insert_match (matches, count, &used, path, dot);
     }
   fclose (f);
@@ -291,6 +348,7 @@ main (int argc, char **argv)
   free (matches);
   free (vec);
   free (qvec);
+  free (pvec);
   free (line);
   buf_free (&query);
   return EXIT_SUCCESS;

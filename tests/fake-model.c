@@ -113,3 +113,53 @@ model_embed (struct model *m, const char *text, float **vec, size_t *dim)
   *dim = d;
   return true;
 }
+
+struct vision
+{
+  int unused;
+};
+
+struct vision *
+vision_open (bool use_gpu)
+{
+  const char *state = getenv ("FAKE_VISION");
+
+  (void) use_gpu;
+  if (state && strcmp (state, "fail") == 0)
+    {
+      error (0, 0, "fake vision model cannot be opened");
+      return NULL;
+    }
+  return malloc (sizeof (struct vision));
+}
+
+void
+vision_close (struct vision *v)
+{
+  free (v);
+}
+
+bool
+vision_embed (struct vision *v, const unsigned char *rgb, float **vec,
+              size_t *dim)
+{
+  const size_t area = VISION_SIDE * VISION_SIDE;
+  double sum[3] = { 0, 0, 0 }, norm = 0;
+  float *p = malloc (FAKE_DIM * sizeof *p);
+
+  (void) v;
+  for (size_t i = 0; i < area; i++)
+    for (size_t c = 0; c < 3; c++)
+      sum[c] += rgb[3 * i + c];
+  for (size_t i = 0; i < FAKE_DIM; i++)
+    {
+      p[i] = 0.05 + (i < 3 ? sum[i] / area / 255 : 0);
+      norm += (double) p[i] * p[i];
+    }
+  norm = sqrt (norm);
+  for (size_t i = 0; i < FAKE_DIM; i++)
+    p[i] /= norm;
+  *vec = p;
+  *dim = FAKE_DIM;
+  return true;
+}

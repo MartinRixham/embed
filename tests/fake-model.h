@@ -18,7 +18,12 @@
      FAKE_500    fail, with a message
      FAKE_DIM3   return a 3-dimensional vector
      FAKE_ZERO   return a vector of zeros
-     FAKE_SLOW   wait 3 seconds, or until a signal arrives, first  */
+     FAKE_SLOW   wait 3 seconds, or until a signal arrives, first
+
+   vision_open fails if the environment variable FAKE_VISION is "fail".
+   vision_embed returns, normalized, 0.05 plus the mean of the red,
+   green and blue channels (from 0 to 1) in dimensions 0, 1 and 2, and
+   0.05 in the others.  It logs nothing.  */
 
 #ifndef FAKE_MODEL_H
 #define FAKE_MODEL_H

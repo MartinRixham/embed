@@ -468,6 +468,119 @@ START_TEST (test_query_options)
 }
 END_TEST
 
+/* Return the hex for a unit vector along dimension K.  */
+static char *
+unit_hex (int k)
+{
+  struct buf b;
+
+  buf_init (&b);
+  for (int i = 0; i < FAKE_DIM; i++)
+    buf_puts (&b, hex_float (i == k));
+  return b.data;
+}
+
+START_TEST (test_split_record_picture)
+{
+  char l1[] = "1 1\t/a\tTEXT\n", l2[] = "1 1\t/b\tTEXT\t-\n";
+  char l3[] = "1 1\t/c\tTEXT\tPIC\n", l4[] = "1 1\t/d\tTEXT\tPIC\n";
+  char *vec, *pic;
+
+  ck_assert_str_eq (split_record (l1, strlen (l1), &vec, &pic), "/a");
+  ck_assert_str_eq (vec, "TEXT\n");
+  ck_assert_ptr_null (pic);
+  ck_assert_str_eq (split_record (l2, strlen (l2), &vec, &pic), "/b");
+  ck_assert_str_eq (vec, "TEXT");
+  ck_assert_ptr_null (pic);
+  ck_assert_str_eq (split_record (l3, strlen (l3), &vec, &pic), "/c");
+  ck_assert_str_eq (vec, "TEXT");
+  ck_assert_str_eq (pic, "PIC\n");
+  /* Without PICTURE, the vector is left as it is.  */
+  ck_assert_str_eq (split_record (l4, strlen (l4), &vec, NULL), "/d");
+  ck_assert_str_eq (vec, "TEXT\tPIC\n");
+}
+END_TEST
+
+START_TEST (test_query_pictures)
+{
+  struct buf b;
+  char line[512];
+  double score[3];
+  char path[3][64];
+
+  /* /h/photo's text is about keyword 1, but its picture about keyword
+     0; /h/plain has no picture, /h/old no picture field.  */
+  buf_init (&b);
+  snprintf (line, sizeof line, "# embed-index model=%s dim=%d\n",
+            EMBED_MODEL, FAKE_DIM);
+  buf_puts (&b, line);
+  snprintf (line, sizeof line, "1 1\t/h/photo\t%s\t", unit_hex (1));
+  buf_puts (&b, line);
+  buf_puts (&b, unit_hex (0));
+  snprintf (line, sizeof line, "\n1 1\t/h/plain\t%s\t-\n", unit_hex (2));
+  buf_puts (&b, line);
+  snprintf (line, sizeof line, "1 1\t/h/old\t%s\n", unit_hex (3));
+  buf_puts (&b, line);
+  write_file (fx.store, b.data, b.len);
+  buf_free (&b);
+
+  ck_assert_int_eq (run_query ("-s", "sourdough", NULL), 0);
+  ck_assert_int_eq (sscanf (out_text (), "%lf\t%63s\n%lf\t%63s\n%lf\t%63s",
+                            &score[0], path[0], &score[1], path[1],
+                            &score[2], path[2]), 6);
+  ck_assert_str_eq (path[0], "/h/photo");
+  /* The query, (1.05, 0.05, ...), less its mean is (0.875, -0.125,
+     ...), and at unit length its first component is
+     0.875 / sqrt (0.875).  */
+  ck_assert_double_eq_tol (score[0], PICTURE_OFFSET + PICTURE_SCALE
+                           * 0.875 / sqrt (0.875), 0.001);
+  /* The others score their text alone.  */
+  double norm = sqrt (1.05 * 1.05 + 7 * 0.05 * 0.05);
+  ck_assert_double_eq_tol (score[1], 0.05 / norm, 0.001);
+  ck_assert_double_eq_tol (score[2], 0.05 / norm, 0.001);
+  ck_assert_str_eq (err_text (), "");
+}
+END_TEST
+
+START_TEST (test_query_picture_scores_below_text)
+{
+  struct buf b;
+  char line[512];
+  double score;
+  char path[64];
+
+  /* A picture that does not match scores less than its text, which
+     does.  */
+  buf_init (&b);
+  snprintf (line, sizeof line, "# embed-index model=%s dim=%d\n"
+            "1 1\t/h/photo\t%s\t", EMBED_MODEL, FAKE_DIM, unit_hex (0));
+  buf_puts (&b, line);
+  buf_puts (&b, unit_hex (5));
+  buf_puts (&b, "\n");
+  write_file (fx.store, b.data, b.len);
+  buf_free (&b);
+
+  ck_assert_int_eq (run_query ("-s", "sourdough", NULL), 0);
+  ck_assert_int_eq (sscanf (out_text (), "%lf\t%63s", &score, path), 2);
+  ck_assert_double_eq_tol (score, 1.05 / sqrt (1.05 * 1.05 + 7 * 0.0025),
+                           0.001);
+}
+END_TEST
+
+START_TEST (test_query_bad_picture_vector)
+{
+  char line[512];
+
+  /* A damaged picture vector is ignored, and the text still counts.  */
+  snprintf (line, sizeof line, "# embed-index model=%s dim=%d\n"
+            "1 1\t/h/a\t%s\tnothex\n", EMBED_MODEL, FAKE_DIM,
+            unit_hex (0));
+  write_file (fx.store, line, (size_t) -1);
+  ck_assert_int_eq (run_query ("sourdough", NULL), 0);
+  ck_assert_str_eq (out_text (), "/h/a\n");
+}
+END_TEST
+
 START_TEST (test_round_trip_with_indexer)
 {
   char *cmd;
@@ -505,6 +618,7 @@ query_suite (void)
   tcase_add_test (tc, test_insert_rejects_when_full);
   tcase_add_test (tc, test_insert_single_slot);
   tcase_add_test (tc, test_insert_negative_scores);
+  tcase_add_test (tc, test_split_record_picture);
   suite_add_tcase (s, tc);
 
   tc = tcase_create ("program");
@@ -529,6 +643,9 @@ query_suite (void)
   tcase_add_test (tc, test_query_missing_query);
   tcase_add_test (tc, test_query_bad_count);
   tcase_add_test (tc, test_query_options);
+  tcase_add_test (tc, test_query_pictures);
+  tcase_add_test (tc, test_query_picture_scores_below_text);
+  tcase_add_test (tc, test_query_bad_picture_vector);
   tcase_add_test (tc, test_round_trip_with_indexer);
   suite_add_tcase (s, tc);
 

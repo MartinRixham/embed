@@ -8,7 +8,8 @@
 
    These need the model's files in ~/.local/share/embed/models, where
    embed-index downloads them, and are skipped without them; they never
-   download anything.  The GPU tests are skipped if OpenVINO finds no
+   download anything.  The image model's tests are skipped in the same
+   way if just that model is missing.  The GPU tests are skipped if OpenVINO finds no
    GPU.  Only a few texts are embedded, to keep the machine usable.  */
 
 #include "../model.c"
@@ -20,6 +21,7 @@
 #include <openvino/c/openvino.h>
 
 static char *real_models;       /* The model directory, if present.  */
+static char *real_vision;       /* The image model's, if present.  */
 static char *home;
 
 static void
@@ -31,6 +33,10 @@ setup (void)
   link = path_join (home, ".local/share/embed/models/nomic-embed-text-v1.5");
   make_parent_dirs (link);
   ck_assert_int_eq (symlink (real_models, link), 0);
+  free (link);
+  link = path_join (home, ".local/share/embed/models/"
+                    "nomic-embed-vision-v1.5");
+  ck_assert_int_eq (symlink (real_vision, link), 0);
   free (link);
   setenv ("HOME", home, 1);
 }
@@ -194,6 +200,124 @@ START_TEST (test_cpu_bad_model)
 }
 END_TEST
 
+static bool
+have_vision (void)
+{
+  char *p = path_join (real_vision, vision_files[0].local);
+  bool ok = access (p, R_OK) == 0;
+
+  if (!ok)
+    fprintf (stderr, "%s is missing; image model test skipped\n", p);
+  free (p);
+  return ok;
+}
+
+/* Return a picture of one colour, freshly allocated.  */
+static unsigned char *
+plain_picture (unsigned char r, unsigned char g, unsigned char b)
+{
+  unsigned char *rgb = xmalloc (3 * VISION_SIDE * VISION_SIDE);
+
+  for (size_t i = 0; i < VISION_SIDE * VISION_SIDE; i++)
+    {
+      rgb[3 * i] = r;
+      rgb[3 * i + 1] = g;
+      rgb[3 * i + 2] = b;
+    }
+  return rgb;
+}
+
+static float *
+embed_picture (struct vision *v, const unsigned char *rgb)
+{
+  float *vec;
+  size_t dim;
+
+  ck_assert (vision_embed (v, rgb, &vec, &dim));
+  ck_assert_uint_eq (dim, 768);
+  return vec;
+}
+
+/* A query vector as compared with pictures: less its mean, at unit
+   length, as embed-query does.  */
+static float *
+picture_query (struct model *m, const char *text)
+{
+  float *q = embed (m, text);
+  double mean = 0, norm = 0;
+
+  for (size_t i = 0; i < 768; i++)
+    mean += q[i];
+  mean /= 768;
+  for (size_t i = 0; i < 768; i++)
+    {
+      q[i] -= mean;
+      norm += (double) q[i] * q[i];
+    }
+  for (size_t i = 0; i < 768; i++)
+    q[i] /= sqrt (norm);
+  return q;
+}
+
+START_TEST (test_cpu_pictures)
+{
+  struct model *m;
+  struct vision *v;
+  float *red, *blue, *again, *q_red, *q_blue;
+
+  if (!have_vision ())
+    return;
+  m = model_open (false);
+  v = vision_open (false);
+  ck_assert_ptr_nonnull (m);
+  ck_assert_ptr_nonnull (v);
+  red = embed_picture (v, plain_picture (230, 20, 20));
+  blue = embed_picture (v, plain_picture (20, 20, 230));
+  q_red = picture_query (m, QUERY_PREFIX "the colour red");
+  q_blue = picture_query (m, QUERY_PREFIX "the colour blue");
+
+  ck_assert_double_eq_tol (dot (red, red), 1.0, 1e-4);
+  ck_assert_double_gt (dot (q_red, red), dot (q_red, blue));
+  ck_assert_double_gt (dot (q_blue, blue), dot (q_blue, red));
+  again = embed_picture (v, plain_picture (230, 20, 20));
+  ck_assert_double_eq_tol (dot (red, again), 1.0, 1e-6);
+  vision_close (v);
+  model_close (m);
+}
+END_TEST
+
+START_TEST (test_gpu_pictures_agree_with_cpu)
+{
+  struct vision *gpu, *cpu;
+  unsigned char *rgb;
+
+  if (!have_gpu () || !have_vision ())
+    {
+      fprintf (stderr, "test_gpu_pictures_agree_with_cpu: skipped\n");
+      return;
+    }
+  gpu = vision_open (true);
+  cpu = vision_open (false);
+  ck_assert_ptr_nonnull (gpu);
+  ck_assert_ptr_nonnull (cpu);
+  ck_assert_ptr_nonnull (gpu->gpu);
+  /* A picture with some detail: a gradient with stripes.  */
+  rgb = plain_picture (0, 0, 0);
+  for (size_t y = 0; y < VISION_SIDE; y++)
+    for (size_t x = 0; x < VISION_SIDE; x++)
+      {
+        unsigned char *px = rgb + 3 * (y * VISION_SIDE + x);
+        px[0] = x;
+        px[1] = y;
+        px[2] = (x / 16 + y / 16) % 2 ? 200 : 40;
+      }
+  double c = dot (embed_picture (gpu, rgb), embed_picture (cpu, rgb));
+  ck_assert_msg (c > 0.999, "cosine %f", c);
+  vision_close (gpu);
+  vision_close (cpu);
+}
+END_TEST
+
 int
 main (void)
 {
@@ -205,11 +329,13 @@ main (void)
 
   if (!real_home
       || asprintf (&real_models, "%s/.local/share/embed/models/"
-                   "nomic-embed-text-v1.5", real_home) < 0)
+                   "nomic-embed-text-v1.5", real_home) < 0
+      || asprintf (&real_vision, "%s/.local/share/embed/models/"
+                   "nomic-embed-vision-v1.5", real_home) < 0)
     return EXIT_FAILURE;
-  for (size_t i = 0; i < sizeof files / sizeof *files; i++)
+  for (size_t i = 0; i < text_source.n_files; i++)
     {
-      char *p = path_join (real_models, files[i].local);
+      char *p = path_join (real_models, text_source.files[i].local);
       if (access (p, R_OK) != 0)
         {
           printf ("test-model: %s is missing; skipped (run embed-index to "
@@ -234,6 +360,8 @@ main (void)
   tcase_add_test (tc, test_gpu_agrees_with_cpu);
   tcase_add_test (tc, test_gpu_bad_model);
   tcase_add_test (tc, test_cpu_bad_model);
+  tcase_add_test (tc, test_cpu_pictures);
+  tcase_add_test (tc, test_gpu_pictures_agree_with_cpu);
   suite_add_tcase (s, tc);
   sr = srunner_create (s);
   srunner_run_all (sr, CK_NORMAL);

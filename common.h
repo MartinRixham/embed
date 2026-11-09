@@ -18,6 +18,10 @@
 /* The embedding model, as named in the store's header.  */
 #define EMBED_MODEL "nomic-embed-text-v1.5"
 
+/* The model that embeds pictures, from images and video frames, into
+   the same space.  */
+#define VISION_MODEL "nomic-embed-vision-v1.5"
+
 /* Prefixes that tell the model whether it is looking at a document or
    a search query.  */
 #define DOCUMENT_PREFIX "search_document: "

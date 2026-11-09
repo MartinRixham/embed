@@ -1,4 +1,4 @@
-/* model.c -- the embedding model, nomic-embed-text v1.5.
+/* model.c -- the embedding models, nomic-embed-text and -vision v1.5.
    Copyright (C) 2026 Martin Rixham
 
    This program is free software: you can redistribute it and/or modify
@@ -6,9 +6,11 @@
    the Free Software Foundation, either version 3 of the License, or
    (at your option) any later version.
 
-   The model is Nomic's ONNX export in float16, pinned to one revision
+   Each model is Nomic's ONNX export in float16, pinned to one revision
    on Hugging Face and checked by its SHA-256 hash.  The same file runs
-   on the GPU through OpenVINO and on the CPU through ONNX Runtime.  */
+   on the GPU through OpenVINO and on the CPU through ONNX Runtime.
+   The vision model was trained to embed images into the text model's
+   space, so that text queries can find them.  */
 
 #include "model.h"
 #include "common.h"
@@ -23,20 +25,54 @@
 #include <string.h>
 #include <unistd.h>
 
-#define MODEL_REVISION "e9b6763023c676ca8431644204f50c2b100d9aab"
-#define MODEL_URL "https://huggingface.co/nomic-ai/nomic-embed-text-v1.5/" \
-  "resolve/" MODEL_REVISION "/"
-#define MODEL_DIR "models/nomic-embed-text-v1.5/"
-
-static const struct
+struct model_file
 {
   const char *remote, *local, *sha256;
-} files[] = {
+};
+
+/* Where a model's files come from, and where they go.  */
+struct model_source
+{
+  const char *name;
+  const char *url;              /* Ends in a slash.  */
+  const char *dir;              /* Under data_path, ending in a slash.  */
+  const char *size;             /* For the user, before downloading.  */
+  size_t n_files;
+  const struct model_file *files;
+};
+
+static const struct model_file text_files[] = {
   { "onnx/model_fp16.onnx", "model_fp16.onnx",
     "cf5b5a86edb00f895561803cfc04729090a958340b8ca2ad76c143f565f6bb04" },
   { "vocab.txt", "vocab.txt",
     "07eced375cec144d27c900241f3e339478dec958f92fddbc551f295c992038a3" },
 };
+
+static const struct model_source text_source = {
+  EMBED_MODEL,
+  "https://huggingface.co/nomic-ai/nomic-embed-text-v1.5/resolve/"
+  "e9b6763023c676ca8431644204f50c2b100d9aab/",
+  "models/nomic-embed-text-v1.5/", "274 MB",
+  sizeof text_files / sizeof *text_files, text_files
+};
+
+static const struct model_file vision_files[] = {
+  { "onnx/model_fp16.onnx", "model_fp16.onnx",
+    "6adad2d74c1da0452d1f90a1427679735bae0a1ee7e17b57a0bf70d8a795ca3d" },
+};
+
+static const struct model_source vision_source = {
+  VISION_MODEL,
+  "https://huggingface.co/nomic-ai/nomic-embed-vision-v1.5/resolve/"
+  "e3a725bce72db07ca4adb1d83da08903f3ee02f8/",
+  "models/nomic-embed-vision-v1.5/", "187 MB",
+  sizeof vision_files / sizeof *vision_files, vision_files
+};
+
+/* How the vision model expects pixels to be scaled, per channel (those
+   of OpenAI's CLIP).  */
+static const float pixel_mean[3] = { 0.48145466, 0.4578275, 0.40821073 };
+static const float pixel_std[3] = { 0.26862954, 0.26130258, 0.27577711 };
 
 /* The model's input limit, in tokens; it can take more, but slowly,
    and the content of a file is cut short well before this anyway.  */
@@ -53,42 +89,44 @@ struct model
   struct onnx_model *cpu;
 };
 
-/* Return the path of the local copy of files[I], freshly allocated.  */
+/* Return the path of the local copy of the Ith file of SRC, freshly
+   allocated.  */
 static char *
-local_path (size_t i)
+local_path (const struct model_source *src, size_t i)
 {
   struct buf b;
-  char *dir = data_path (MODEL_DIR);
+  char *dir = data_path (src->dir);
 
   buf_init (&b);
   buf_puts (&b, dir);
-  buf_puts (&b, files[i].local);
+  buf_puts (&b, src->files[i].local);
   free (dir);
   return b.data;
 }
 
-/* Download the model's files if they are missing.  */
+/* Download the files of SRC if they are missing.  */
 static bool
-fetch_model (void)
+fetch_model (const struct model_source *src)
 {
   bool announced = false;
 
-  for (size_t i = 0; i < sizeof files / sizeof *files; i++)
+  for (size_t i = 0; i < src->n_files; i++)
     {
-      char *path = local_path (i);
+      const struct model_file *file = &src->files[i];
+      char *path = local_path (src, i);
       char *url;
       bool ok;
 
       if (!announced && access (path, F_OK) != 0)
         {
-          error (0, 0, "downloading the %s model (274 MB); this is needed "
-                 "only once", EMBED_MODEL);
+          error (0, 0, "downloading the %s model (%s); this is needed "
+                 "only once", src->name, src->size);
           announced = true;
         }
-      url = xmalloc (strlen (MODEL_URL) + strlen (files[i].remote) + 1);
-      strcpy (url, MODEL_URL);
-      strcat (url, files[i].remote);
-      ok = fetch_file (url, path, files[i].sha256);
+      url = xmalloc (strlen (src->url) + strlen (file->remote) + 1);
+      strcpy (url, src->url);
+      strcat (url, file->remote);
+      ok = fetch_file (url, path, file->sha256);
       free (url);
       free (path);
       if (!ok)
@@ -125,12 +163,12 @@ model_open (bool use_gpu)
   struct model *m;
   char *onnx, *vocab;
 
-  if (!fetch_model ())
+  if (!fetch_model (&text_source))
     return NULL;
   m = xmalloc (sizeof *m);
   memset (m, 0, sizeof *m);
-  onnx = local_path (0);
-  vocab = local_path (1);
+  onnx = local_path (&text_source, 0);
+  vocab = local_path (&text_source, 1);
   if (!tokenizer_load (&m->tokenizer, vocab))
     {
       error (0, errno, "cannot load %s", vocab);
@@ -187,4 +225,67 @@ model_embed (struct model *m, const char *text, float **vec, size_t *dim)
   if (m->gpu)
     return ov_embed (m->gpu, ids, n, vec, dim);
   return onnx_embed (m->cpu, ids, n, vec, dim);
+}
+
+struct vision
+{
+  struct ov_embed *gpu;
+  struct onnx_model *cpu;
+  float pixels[3 * VISION_SIDE * VISION_SIDE];
+};
+
+struct vision *
+vision_open (bool use_gpu)
+{
+  struct vision *v;
+  char *onnx;
+
+  if (!fetch_model (&vision_source))
+    return NULL;
+  v = xmalloc (sizeof *v);
+  memset (v, 0, sizeof *v);
+  onnx = local_path (&vision_source, 0);
+  if (use_gpu)
+    {
+      char *cache = cache_dir ();
+      const char *why;
+
+      v->gpu = ov_embed_load_image (onnx, cache, VISION_SIDE, &why);
+      if (!v->gpu)
+        error (0, 0, "%s; embedding images on the CPU instead", why);
+      free (cache);
+    }
+  if (!v->gpu && !(v->cpu = onnx_model_load (onnx, CPU_THREADS)))
+    {
+      free (v);
+      v = NULL;
+    }
+  free (onnx);
+  return v;
+}
+
+void
+vision_close (struct vision *v)
+{
+  if (!v)
+    return;
+  ov_embed_free (v->gpu);
+  onnx_model_free (v->cpu);
+  free (v);
+}
+
+bool
+vision_embed (struct vision *v, const unsigned char *rgb, float **vec,
+              size_t *dim)
+{
+  const size_t area = VISION_SIDE * VISION_SIDE;
+
+  /* Interleaved bytes to planes of scaled floats.  */
+  for (size_t c = 0; c < 3; c++)
+    for (size_t i = 0; i < area; i++)
+      v->pixels[c * area + i]
+        = (rgb[3 * i + c] / 255.0f - pixel_mean[c]) / pixel_std[c];
+  if (v->gpu)
+    return ov_embed_image (v->gpu, v->pixels, vec, dim);
+  return onnx_embed_image (v->cpu, v->pixels, VISION_SIDE, vec, dim);
 }

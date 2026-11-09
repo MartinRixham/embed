@@ -1,4 +1,4 @@
-/* ov-embed.h -- run a BERT-style embedding model on a GPU with OpenVINO.
+/* ov-embed.h -- run embedding models on a GPU with OpenVINO.
    Copyright (C) 2026 Martin Rixham
 
    This program is free software: you can redistribute it and/or modify
@@ -27,6 +27,16 @@ void ov_embed_free (struct ov_embed *m);
    of them, into a freshly allocated unit vector.  */
 bool ov_embed (struct ov_embed *m, const int64_t *ids, size_t n,
                float **vec, size_t *dim);
+
+/* Like ov_embed_load, but for an image model like the one
+   onnx_embed_image takes, with images of SIDE pixels square.  */
+struct ov_embed *ov_embed_load_image (const char *path,
+                                      const char *cache_dir, size_t side,
+                                      const char **why);
+
+/* Like onnx_embed_image, for a model loaded by ov_embed_load_image.  */
+bool ov_embed_image (struct ov_embed *m, const float *pixels, float **vec,
+                     size_t *dim);
 
 /* The GPU needs fixed input lengths, so texts are padded to the
    smallest of these that fits.  */

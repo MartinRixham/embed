@@ -1,4 +1,4 @@
-/* onnx-embed.h -- run a BERT-style embedding model with ONNX Runtime.
+/* onnx-embed.h -- run embedding models with ONNX Runtime.
    Copyright (C) 2026 Martin Rixham
 
    This program is free software: you can redistribute it and/or modify
@@ -27,5 +27,13 @@ void onnx_model_free (struct onnx_model *m);
    return true.  */
 bool onnx_embed (struct onnx_model *m, const int64_t *ids, size_t n,
                  float **vec, size_t *dim);
+
+/* Embed an image with a vision transformer that takes one input of
+   shape 1 x 3 x SIDE x SIDE: PIXELS holds the 3 channels one after
+   another, each row by row.  The embedding is the output for the first
+   (class) token, normalized to unit length.  Return it like
+   onnx_embed.  */
+bool onnx_embed_image (struct onnx_model *m, const float *pixels,
+                       size_t side, float **vec, size_t *dim);
 
 #endif /* EMBED_ONNX_EMBED_H */
