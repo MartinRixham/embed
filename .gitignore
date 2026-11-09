@@ -2,6 +2,7 @@
 *.o
 embed-index
 embed-query
+embed-search-provider
 
 # Test build output.
 tests/build/

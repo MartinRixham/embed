@@ -146,7 +146,7 @@ err_text (void)
 /* insert_match.  */
 
 static void
-free_matches (struct match *m, size_t used)
+free_match_paths (struct match *m, size_t used)
 {
   for (size_t i = 0; i < used; i++)
     free (m[i].path);
@@ -167,7 +167,7 @@ START_TEST (test_insert_sorted)
   ck_assert_str_eq (m[2].path, "d");
   ck_assert_str_eq (m[3].path, "c");
   ck_assert_str_eq (m[4].path, "e");
-  free_matches (m, used);
+  free_match_paths (m, used);
 }
 END_TEST
 
@@ -186,7 +186,7 @@ START_TEST (test_insert_keeps_best_n)
   ck_assert_float_eq (m[0].score, 99);
   ck_assert_float_eq (m[1].score, 98);
   ck_assert_float_eq (m[2].score, 97);
-  free_matches (m, used);
+  free_match_paths (m, used);
 }
 END_TEST
 
@@ -202,7 +202,7 @@ START_TEST (test_insert_rejects_when_full)
   ck_assert_uint_eq (used, 2);
   ck_assert_str_eq (m[0].path, "a");
   ck_assert_str_eq (m[1].path, "b");
-  free_matches (m, used);
+  free_match_paths (m, used);
 }
 END_TEST
 
@@ -216,7 +216,7 @@ START_TEST (test_insert_single_slot)
   insert_match (m, 1, &used, "c", 0.4f);
   ck_assert_uint_eq (used, 1);
   ck_assert_str_eq (m[0].path, "b");
-  free_matches (m, used);
+  free_match_paths (m, used);
 }
 END_TEST
 
@@ -230,7 +230,7 @@ START_TEST (test_insert_negative_scores)
   insert_match (m, 3, &used, "c", -0.9f);
   ck_assert_str_eq (m[0].path, "b");
   ck_assert_str_eq (m[2].path, "c");
-  free_matches (m, used);
+  free_match_paths (m, used);
 }
 END_TEST
 

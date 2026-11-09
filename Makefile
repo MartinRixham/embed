@@ -1,4 +1,4 @@
-# Makefile for embed-index and embed-query.
+# Makefile for embed-index, embed-query and embed-search-provider.
 
 CC ?= gcc
 CFLAGS ?= -O2 -g -Wall -Wextra
@@ -7,10 +7,16 @@ CPPFLAGS += -D_GNU_SOURCE $(shell pkg-config --cflags $(PKGS))
 # OpenVINO's pkg-config file names libraries that only its C++ API
 # needs, so link its C library directly.
 LDLIBS_MODEL = $(shell pkg-config --libs $(PKGS)) -lopenvino_c -lm
-prefix ?= $(HOME)/.local
+# Install system wide, with "sudo make install": GNOME Shell reads
+# search providers only from the system data directories.
+prefix ?= /usr/local
 bindir ?= $(prefix)/bin
+datadir ?= $(prefix)/share
+searchproviderdir ?= $(datadir)/gnome-shell/search-providers
+GIO_CFLAGS = $(shell pkg-config --cflags gio-2.0)
+GIO_LIBS = $(shell pkg-config --libs gio-2.0)
 
-PROGRAMS = embed-index embed-query
+PROGRAMS = embed-index embed-query embed-search-provider
 MODEL_OBJS = model.o fetch.o tokenizer.o onnx-embed.o ov-embed.o \
   whisper.o
 
@@ -19,12 +25,22 @@ all: $(PROGRAMS)
 embed-index: embed-index.o describe.o common.o $(MODEL_OBJS)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS_MODEL) -lmagic
 
-embed-query: embed-query.o describe.o common.o $(MODEL_OBJS)
+embed-query: embed-query.o search.o describe.o common.o $(MODEL_OBJS)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS_MODEL) -lmagic
 
-common.o describe.o embed-index.o embed-query.o fetch.o model.o \
-  onnx-embed.o ov-embed.o tokenizer.o whisper.o: common.h
-describe.o embed-index.o embed-query.o model.o: model.h
+embed-search-provider: embed-search-provider.o search.o common.o \
+  $(MODEL_OBJS)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS_MODEL) $(GIO_LIBS)
+
+embed-search-provider.o: embed-search-provider.c
+	$(CC) $(CPPFLAGS) $(GIO_CFLAGS) $(CFLAGS) -c -o $@ $<
+
+common.o describe.o embed-index.o embed-query.o embed-search-provider.o \
+  fetch.o model.o onnx-embed.o ov-embed.o search.o tokenizer.o \
+  whisper.o: common.h
+describe.o embed-index.o embed-query.o embed-search-provider.o \
+  model.o: model.h
+embed-query.o embed-search-provider.o search.o: search.h
 describe.o embed-index.o embed-query.o: describe.h
 model.o fetch.o: fetch.h
 model.o onnx-embed.o: onnx-embed.h
@@ -33,9 +49,19 @@ model.o tokenizer.o: tokenizer.h
 model.o whisper.o: whisper.h
 whisper.o: ov-embed.h
 
+SUBST = sed 's|@bindir@|$(bindir)|g'
+
+# GNOME Shell picks the search provider up when you next log in.
 install: all
-	install -d $(DESTDIR)$(bindir)
+	install -d $(DESTDIR)$(bindir) $(DESTDIR)$(datadir)/applications \
+	  $(DESTDIR)$(datadir)/dbus-1/services $(DESTDIR)$(searchproviderdir)
 	install -m 755 $(PROGRAMS) $(DESTDIR)$(bindir)
+	$(SUBST) data/embed-search.desktop.in \
+	  > $(DESTDIR)$(datadir)/applications/embed-search.desktop
+	$(SUBST) data/embed.SearchProvider.service.in \
+	  > $(DESTDIR)$(datadir)/dbus-1/services/embed.SearchProvider.service
+	install -m 644 data/embed-search-provider.ini \
+	  $(DESTDIR)$(searchproviderdir)/embed-search-provider.ini
 
 # A tool for checking the tokenizer by hand.
 tools/tokenize: tools/tokenize.c tokenizer.c common.c tokenizer.h common.h
@@ -95,7 +121,7 @@ $(TEST_BUILD)/test-index: $(TEST_BUILD)/test-index.o \
 	$(CC) $(TEST_CFLAGS) -o $@ $^ $(TEST_LIBS) -lmagic -lutil
 
 $(TEST_BUILD)/test-query: $(TEST_BUILD)/test-query.o \
-  $(TEST_BUILD)/src-describe.o $(TEST_BUILD)/src-common.o \
+  $(TEST_BUILD)/src-search.o $(TEST_BUILD)/src-describe.o $(TEST_BUILD)/src-common.o \
   $(TEST_BUILD)/fake-model.o $(TEST_SUPPORT)
 	$(CC) $(TEST_CFLAGS) -o $@ $^ $(TEST_LIBS) -lmagic
 

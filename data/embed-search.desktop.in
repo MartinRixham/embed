@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Embedded Search
+Comment=Find files by meaning, from the Activities overview
+Icon=system-search
+Exec=@bindir@/embed-search-provider
+Terminal=false
+Categories=Utility;
+Keywords=search;files;embed;
