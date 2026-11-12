@@ -26,7 +26,8 @@
 
    A long file is also embedded in chunks: passages spread through its
    text, each embedded on its own, so that a search can find it by what
-   one part of it says.  A search scores a file by the best of its
+   one part of it says.  A recording's chunks are the transcript of
+   what is said in it, which its description leaves out.  A search scores a file by the best of its
    vectors.  There are many chunks, so they are embedded a few at a
    time, after the files that are new or changed, for as long as
    --chunk-time allows, each run carrying on where the last left off
@@ -538,7 +539,7 @@ chunk_candidate (struct candidate *c, struct model *m, magic_t magic_mime,
 {
   struct stat st;
   struct buf text;
-  size_t k, i, n = 0;
+  size_t k, skip, i, n = 0;
 
   if (lstat (c->path, &st) != 0 || !S_ISREG (st.st_mode)
       || st.st_mtime != c->mtime || st.st_size != c->size)
@@ -549,7 +550,7 @@ chunk_candidate (struct candidate *c, struct model *m, magic_t magic_mime,
     }
 
   buf_init (&text);
-  k = chunk_text (magic_mime, c->path, c->size, &text);
+  k = chunk_text (magic_mime, c->path, c->size, &text, &skip);
   if (k == 0 && c->total > 0)
     {
       /* It had text before, so this is likely a helper timing out.  */
@@ -580,7 +581,7 @@ chunk_candidate (struct candidate *c, struct model *m, magic_t magic_mime,
     {
       float *vec;
 
-      if (!embed_chunk (m, c->path, &text, k, i, dim, &vec))
+      if (!embed_chunk (m, c->path, &text, k, skip, i, dim, &vec))
         {
           error (0, 0, "%s: could not embed chunk %zu", c->path, i + 1);
           c->skip = true;

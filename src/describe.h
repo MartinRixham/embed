@@ -70,24 +70,27 @@ bool embed_file (struct model *m, magic_t magic_mime, magic_t magic_desc,
 
 /* Return how many chunks of a file of TEXT_LEN bytes of text to embed,
    if it may have at most CAP: one for each window of text after the
-   first, which its description covers, up to CAP.  */
-size_t chunk_plan (size_t text_len, size_t cap);
+   first SKIP, which its description covers, up to CAP.  */
+size_t chunk_plan (size_t text_len, size_t skip, size_t cap);
 
 /* Put the whole text of FILE, of SIZE bytes, into OUT, to be split into
    chunks, and return how many chunks to embed of it: none if it is not
-   running text, or too short to need them.  */
+   running text, or too short to need them.  Store in *SKIP how many
+   windows at the start of the text its description covers already: 1,
+   or 0 for what is said in a recording, which it leaves out.  */
 size_t chunk_text (magic_t magic_mime, const char *file, long long size,
-                   struct buf *out);
+                   struct buf *out, size_t *skip);
 
 /* Store in *START and *END the byte range of TEXT that is the I'th
-   chunk to embed of K, from a window spread through it.  */
-void chunk_window (const struct buf *text, size_t k, size_t i,
+   chunk to embed of K, from a window spread through it after the first
+   SKIP.  */
+void chunk_window (const struct buf *text, size_t k, size_t skip, size_t i,
                    size_t *start, size_t *end);
 
-/* Embed the I'th chunk of K of TEXT, the text of FILE, into *VEC, of
-   DIM floats.  */
+/* Embed the I'th chunk of K of TEXT, the text of FILE whose first SKIP
+   windows are left out, into *VEC, of DIM floats.  */
 bool embed_chunk (struct model *m, const char *file, const struct buf *text,
-                  size_t k, size_t i, size_t dim, float **vec);
+                  size_t k, size_t skip, size_t i, size_t dim, float **vec);
 
 /* Close the vision and speech models, if they were opened.  */
 void close_media_models (void);

@@ -10,16 +10,19 @@ models once.
   short description of its name, location and type and, where
   possible, its content: plain text, PDF text, office document text
   (OpenDocument and Office Open XML), EPUB book metadata and text, OCR
-  of images, audio and video metadata, and a transcript of what is
-  said.
+  of images, and the kind, length, format and tags of audio and video.
 - Images and videos are also embedded by what they show, with
   [nomic-embed-vision-v1.5], into the same space as the text, so a text
   query can find a photo.
-- Speech in audio and video is transcribed by [Whisper] (base).
+- Speech in audio and video is transcribed by [Whisper] (base), and the
+  transcript is embedded as the recording's chunks, apart from its
+  description, so that what is said does not drown out what the file
+  is.
 - Long files are also embedded in chunks: passages spread through the
   text, each embedded on its own, so that a search finds a book by
   what one chapter says.  A file scores the best of its vectors.
-  Documents get up to 64 chunks and other text, such as code, up to 4.
+  Documents get up to 64 chunks and other text, such as code, and
+  transcripts up to 4.
   The chunks are embedded a little at a time, after new and changed
   files, and each run carries on where the last one stopped.
 

@@ -8,13 +8,21 @@
 
    A file is turned into a short text description (its name, location,
    type and, where possible, its content: plain text, PDF text, office
-   document text, EPUB book metadata and text, OCR of images, or audio/video metadata and a
-   transcript of what is said) for the text model, and an image or
-   video into a picture vector, from pixels that ffmpeg decodes.  */
+   document text, EPUB book metadata and text, OCR of images, or a
+   summary of a recording: its kind, length, format and tags) for the
+   text model, and an image or video into a picture vector, from pixels
+   that ffmpeg decodes.
+
+   What is said in a recording goes into its chunks, not its
+   description.  A transcript is mostly dialogue, which pulls the
+   description's vector towards what is talked about and away from
+   what the file is, so that a search for "movies" or "video files"
+   would pass the videos by.  */
 
 #include "describe.h"
 #include "model.h"
 
+#include <ctype.h>
 #include <errno.h>
 #include <error.h>
 #include <fcntl.h>
@@ -22,6 +30,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -40,6 +49,9 @@
    what one passage of it says.  */
 #define CHUNKS_PROSE 64
 #define CHUNKS_OTHER 4
+
+/* The most chunks of a recording's transcript.  */
+#define CHUNKS_SPEECH 4
 
 /* How many frames of a video to embed; their average stands for the
    video.  */
@@ -556,9 +568,11 @@ grab_audio (const char *file, double at, float *pcm)
 
 /* Append to OUT what is said in FILE: the transcripts of up to
    SPEECH_WINDOWS windows, together covering the whole of a short
-   recording and spread evenly through a long one.  */
+   recording and spread evenly through a long one, and up to LIMIT
+   bytes in all.  */
 static void
-transcribe (struct speech *sp, const char *file, struct buf *out)
+transcribe (struct speech *sp, const char *file, struct buf *out,
+            size_t limit)
 {
   const double window = (double) SPEECH_SAMPLES / SPEECH_RATE;
   double duration = media_duration (file);
@@ -583,15 +597,225 @@ transcribe (struct speech *sp, const char *file, struct buf *out)
       if (out->len > start)
         buf_puts (out, " ...");
       if (!speech_transcribe (sp, pcm, n, out)
-          || out->len - start > MAX_CONTENT)
+          || out->len - start > limit)
         break;
     }
   free (pcm);
-  if (out->len - start > MAX_CONTENT)
+  if (out->len - start > limit)
     {
-      out->len = start + MAX_CONTENT;
+      out->len = start + limit;
       out->data[out->len] = '\0';
     }
+}
+
+/* Codecs by the names people know them by, where those are not
+   ffprobe's.  */
+static const char *const codec_names[][2] = {
+  {"h264", "H.264"}, {"hevc", "H.265"}, {"av1", "AV1"}, {"vp8", "VP8"},
+  {"vp9", "VP9"}, {"mpeg4", "MPEG-4"}, {"mpeg2video", "MPEG-2"},
+  {"mpeg1video", "MPEG-1"}, {"theora", "Theora"}, {"prores", "ProRes"},
+  {"aac", "AAC"}, {"mp3", "MP3"}, {"mp2", "MP2"}, {"ac3", "Dolby Digital"},
+  {"eac3", "Dolby Digital Plus"}, {"truehd", "Dolby TrueHD"},
+  {"dts", "DTS"}, {"opus", "Opus"}, {"vorbis", "Vorbis"}, {"flac", "FLAC"},
+  {"alac", "Apple Lossless"}, {"wmav2", "WMA"}, {"amr_nb", "AMR"},
+};
+
+/* Tags that say how a file was made rather than what is in it.  */
+static const char *const technical_tags[] = {
+  "major_brand", "minor_version", "compatible_brands", "encoder",
+  "encoded_by", "creation_time", "handler_name", "vendor_id", "duration",
+  "itunsmpb", "itunnorm", "itunes_cddb_ids", "media_type", NULL
+};
+
+/* Append the name of CODEC, as ffprobe names it, to OUT.  */
+static void
+put_codec (struct buf *out, const char *codec)
+{
+  for (size_t i = 0; i < sizeof codec_names / sizeof *codec_names; i++)
+    if (strcmp (codec, codec_names[i][0]) == 0)
+      {
+        buf_puts (out, codec_names[i][1]);
+        return;
+      }
+  if (starts_with (codec, "pcm_"))
+    buf_puts (out, "PCM");
+  else
+    buf_puts (out, codec);
+}
+
+/* Append SECONDS, rounded, to OUT in words.  */
+static void
+put_duration (struct buf *out, double seconds)
+{
+  long s = (long) (seconds + 0.5), m = (seconds + 30) / 60;
+  char t[64];
+
+  if (s < 60)
+    snprintf (t, sizeof t, "%ld second%s", s, s == 1 ? "" : "s");
+  else if (m < 60)
+    snprintf (t, sizeof t, "%ld minute%s", m, m == 1 ? "" : "s");
+  else if (m % 60 == 0)
+    snprintf (t, sizeof t, "%ld hour%s", m / 60, m / 60 == 1 ? "" : "s");
+  else
+    snprintf (t, sizeof t, "%ld hour%s %ld minute%s", m / 60,
+              m / 60 == 1 ? "" : "s", m % 60, m % 60 == 1 ? "" : "s");
+  buf_puts (out, t);
+}
+
+/* Append a summary of the recording FILE, of type MIME, to OUT: what
+   kind of recording it is, how long, its picture size and codecs, then
+   its tags, one to a line, such as "Title: Moonlight Sonata".  */
+static void
+describe_media (const char *file, const char *mime, struct buf *out)
+{
+  const char *argv[] = { "ffprobe", "-v", "quiet", "-show_entries",
+                         ("format=duration:format_tags"
+                          ":stream=codec_type,codec_name,width,height"
+                          ":stream_disposition=attached_pic"),
+                         file, NULL };
+  bool video = starts_with (mime, "video/"), in_stream = false;
+  bool subtitles = false, cover = false;
+  char type[32] = "", codec[64] = "", video_codec[64] = "";
+  long width = 0, height = 0, w = 0, h = 0;
+  double duration = -1;
+  struct buf info, sound, tags;
+  char *line, *save;
+
+  buf_init (&info);
+  buf_init (&sound);
+  buf_init (&tags);
+  run_capture (argv, &info, MAX_CONTENT);
+  for (line = strtok_r (info.data, "\n", &save); line;
+       line = strtok_r (NULL, "\n", &save))
+    {
+      char *eq = strchr (line, '=');
+
+      if (strcmp (line, "[STREAM]") == 0)
+        {
+          in_stream = true;
+          type[0] = codec[0] = '\0';
+          w = h = 0;
+          cover = false;
+        }
+      else if (strcmp (line, "[/STREAM]") == 0)
+        {
+          in_stream = false;
+          if (strcmp (type, "video") == 0 && !cover && !video_codec[0])
+            {
+              strcpy (video_codec, codec);
+              width = w;
+              height = h;
+            }
+          else if (strcmp (type, "audio") == 0 && codec[0])
+            {
+              /* Each codec once, however many tracks use it.  */
+              struct buf name;
+
+              buf_init (&name);
+              put_codec (&name, codec);
+              if (!sound.data || !strstr (sound.data, name.data))
+                {
+                  if (sound.len > 0)
+                    buf_puts (&sound, ", ");
+                  buf_append (&sound, name.data, name.len);
+                }
+              buf_free (&name);
+            }
+          else if (strcmp (type, "subtitle") == 0)
+            subtitles = true;
+        }
+      else if (!eq)
+        continue;
+      else if (in_stream)
+        {
+          *eq++ = '\0';
+          if (strcmp (line, "codec_type") == 0)
+            snprintf (type, sizeof type, "%s", eq);
+          else if (strcmp (line, "codec_name") == 0)
+            snprintf (codec, sizeof codec, "%s", eq);
+          else if (strcmp (line, "width") == 0)
+            w = atol (eq);
+          else if (strcmp (line, "height") == 0)
+            h = atol (eq);
+          else if (strcmp (line, "DISPOSITION:attached_pic") == 0)
+            cover = atoi (eq) != 0;
+        }
+      else if (starts_with (line, "duration="))
+        {
+          char *end;
+
+          duration = strtod (eq + 1, &end);
+          if (end == eq + 1 || !(duration > 0) || duration > 1e9)
+            duration = -1;
+        }
+      else if (starts_with (line, "TAG:") && eq[1])
+        {
+          char *key = line + 4;
+          bool skip = false;
+
+          *eq++ = '\0';
+          for (size_t i = 0; technical_tags[i] && !skip; i++)
+            skip = strcasecmp (key, technical_tags[i]) == 0;
+          if (skip || !*key)
+            continue;
+          for (char *k = key; *k; k++)
+            {
+              *k = k == key ? toupper ((unsigned char) *k)
+                : tolower ((unsigned char) *k);
+              if (*k == '_')
+                *k = ' ';
+            }
+          buf_puts (&tags, key);
+          buf_puts (&tags, ": ");
+          buf_puts (&tags, eq);
+          buf_puts (&tags, "\n");
+        }
+    }
+
+  buf_puts (out, video ? "Video" : "Audio recording");
+  if (duration > 0)
+    {
+      buf_puts (out, ", ");
+      put_duration (out, duration);
+      buf_puts (out, " long");
+    }
+  if (video && width > 0 && height > 0)
+    {
+      char size[64];
+
+      snprintf (size, sizeof size, ", %ldx%ld", width, height);
+      buf_puts (out, size);
+    }
+  if (video && video_codec[0])
+    {
+      buf_puts (out, ", ");
+      put_codec (out, video_codec);
+    }
+  if (video)
+    {
+      if (sound.len > 0)
+        {
+          buf_puts (out, ", with ");
+          buf_append (out, sound.data, sound.len);
+          buf_puts (out, " sound");
+        }
+      else
+        buf_puts (out, ", silent");
+      if (subtitles)
+        buf_puts (out, " and subtitles");
+    }
+  else if (sound.len > 0)
+    {
+      buf_puts (out, ", ");
+      buf_append (out, sound.data, sound.len);
+    }
+  buf_puts (out, "\n");
+  if (tags.len > MAX_CONTENT)
+    tags.len = MAX_CONTENT;
+  buf_append (out, tags.data, tags.len);
+  buf_free (&info);
+  buf_free (&sound);
+  buf_free (&tags);
 }
 
 /* Append up to LIMIT bytes of the text of the office document FILE,
@@ -620,8 +844,8 @@ extract_office (const char *file, const char *mime, struct buf *out,
 
 /* Append a textual rendering of the content of FILE, of type MIME, to
    OUT: up to LIMIT bytes of it.  If WHOLE, it is for chunks, so render
-   all of a PDF, and nothing of images and recordings, whose content is
-   not text that runs on.  */
+   all of a PDF, what is said in a recording, and nothing of images,
+   whose content is not text that runs on.  */
 static void
 extract_upto (const char *file, const char *mime, struct buf *out,
               size_t limit, bool whole)
@@ -642,7 +866,14 @@ extract_upto (const char *file, const char *mime, struct buf *out,
     }
   else if (whole)
     {
-      if (strcmp (mime, "application/epub+zip") == 0)
+      if (starts_with (mime, "audio/") || starts_with (mime, "video/"))
+        {
+          struct speech *sp = get_speech ();
+
+          if (sp)
+            transcribe (sp, file, out, limit);
+        }
+      else if (strcmp (mime, "application/epub+zip") == 0)
         extract_epub (file, out, limit);
       else if (starts_with (mime, "application/vnd.openxmlformats")
                || starts_with (mime, "application/vnd.oasis.opendocument"))
@@ -655,26 +886,7 @@ extract_upto (const char *file, const char *mime, struct buf *out,
       run_capture (argv, out, MAX_CONTENT);
     }
   else if (starts_with (mime, "audio/") || starts_with (mime, "video/"))
-    {
-      const char *argv[] = { "ffprobe", "-v", "quiet", "-show_entries",
-                             ("format=duration:format_tags"
-                              ":stream=codec_name,width,height"),
-                             "-of", "default=nw=1", file, NULL };
-      struct speech *sp = get_speech ();
-      struct buf said;
-
-      run_capture (argv, out, MAX_CONTENT);
-      buf_init (&said);
-      if (sp)
-        transcribe (sp, file, &said);
-      if (said.len > 0)
-        {
-          buf_puts (out, "Speech:");
-          buf_puts (out, said.data);
-          buf_puts (out, "\n");
-        }
-      buf_free (&said);
-    }
+    describe_media (file, mime, out);
   else if (strcmp (mime, "application/epub+zip") == 0)
     extract_epub (file, out, limit);
   else if (starts_with (mime, "application/vnd.openxmlformats")
@@ -695,6 +907,8 @@ extract_content (const char *file, const char *mime, struct buf *out)
 static size_t
 chunk_cap (const char *mime)
 {
+  if (starts_with (mime, "audio/") || starts_with (mime, "video/"))
+    return CHUNKS_SPEECH;
   static const char *const prose[] = {
     "application/pdf", "application/epub+zip", "text/plain",
     "text/markdown", "text/x-markdown", "text/html", "text/rtf",
@@ -721,37 +935,41 @@ n_windows (size_t len)
 }
 
 size_t
-chunk_plan (size_t text_len, size_t cap)
+chunk_plan (size_t text_len, size_t skip, size_t cap)
 {
   size_t n = n_windows (text_len);
 
-  /* The first window is in the file's own description already.  */
-  if (n < 2)
+  if (n <= skip)
     return 0;
-  return n - 1 < cap ? n - 1 : cap;
+  return n - skip < cap ? n - skip : cap;
 }
 
 size_t
 chunk_text (magic_t magic_mime, const char *file, long long size,
-            struct buf *out)
+            struct buf *out, size_t *skip)
 {
   const char *m = magic_file (magic_mime, file);
   char *mime;
   size_t cap, k;
   long saved = helper_timeout;
 
+  /* The first window of text is in the file's own description already,
+     but none of what is said in a recording.  */
+  *skip = m && (starts_with (m, "audio/") || starts_with (m, "video/"))
+    ? 0 : 1;
   if (!m || !(cap = chunk_cap (m)))
     return 0;
   /* Plain text is no longer than the file.  */
   if (textual_mime (m) && size <= CHUNK_BYTES)
     return 0;
   mime = xstrdup (m);
-  /* Rendering the whole of a book takes longer than its start.  */
+  /* Rendering the whole of a book takes longer than its start, and
+     decoding sound from far into a long video longer than its type.  */
   helper_timeout = saved * 15;
   extract_upto (file, mime, out, CHUNK_TEXT_MAX, true);
   helper_timeout = saved;
   free (mime);
-  k = chunk_plan (out->len, cap);
+  k = chunk_plan (out->len, *skip, cap);
   return k;
 }
 
@@ -800,11 +1018,11 @@ word_start (const char *text, size_t len, size_t at)
 }
 
 void
-chunk_window (const struct buf *text, size_t k, size_t i, size_t *start,
-              size_t *end)
+chunk_window (const struct buf *text, size_t k, size_t skip, size_t i,
+              size_t *start, size_t *end)
 {
   size_t n = n_windows (text->len);
-  size_t w = 1 + chunk_slot (k, i) * (n - 1) / k;
+  size_t w = skip + chunk_slot (k, i) * (n - skip) / k;
 
   *start = word_start (text->data, text->len, w * CHUNK_BYTES);
   *end = w * CHUNK_BYTES + CHUNK_BYTES;
@@ -818,14 +1036,14 @@ chunk_window (const struct buf *text, size_t k, size_t i, size_t *start,
 
 bool
 embed_chunk (struct model *m, const char *file, const struct buf *text,
-             size_t k, size_t i, size_t dim, float **vec)
+             size_t k, size_t skip, size_t i, size_t dim, float **vec)
 {
   const char *name = strrchr (file, '/');
   struct buf b;
   size_t start, end;
   bool ok;
 
-  chunk_window (text, k, i, &start, &end);
+  chunk_window (text, k, skip, i, &start, &end);
   buf_init (&b);
   buf_puts (&b, DOCUMENT_PREFIX);
   buf_puts (&b, "From the file ");

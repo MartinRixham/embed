@@ -534,9 +534,12 @@ START_TEST (test_extract_audio_tags)
          "-metadata title='Moonlight Sonata' -metadata artist=Beethoven "
          "song.mp3");
   text = extract ("song.mp3", "audio/mpeg");
-  ck_assert_ptr_nonnull (strstr (text, "TAG:title=Moonlight Sonata"));
-  ck_assert_ptr_nonnull (strstr (text, "TAG:artist=Beethoven"));
-  ck_assert_ptr_nonnull (strstr (text, "duration="));
+  ck_assert_msg (starts_with (text, "Audio recording, 1 second long, MP3\n"),
+                 "%s", text);
+  ck_assert_ptr_nonnull (strstr (text, "\nTitle: Moonlight Sonata\n"));
+  ck_assert_ptr_nonnull (strstr (text, "\nArtist: Beethoven\n"));
+  /* How it was made is left out.  */
+  ck_assert_ptr_null (strstr (text, "ncoder"));
 }
 END_TEST
 
@@ -549,9 +552,53 @@ START_TEST (test_extract_video_streams)
   shell ("ffmpeg -v quiet -f lavfi -i testsrc=s=320x240:d=1 "
          "-metadata title='Sunset timelapse' clip.mp4");
   text = extract ("clip.mp4", "video/mp4");
-  ck_assert_ptr_nonnull (strstr (text, "TAG:title=Sunset timelapse"));
-  ck_assert_ptr_nonnull (strstr (text, "width=320"));
-  ck_assert_ptr_nonnull (strstr (text, "height=240"));
+  ck_assert_msg (starts_with (text, "Video, 1 second long, 320x240, "),
+                 "%s", text);
+  ck_assert_ptr_nonnull (strstr (text, ", silent\n"));
+  ck_assert_ptr_nonnull (strstr (text, "\nTitle: Sunset timelapse\n"));
+  ck_assert_ptr_null (strstr (text, "Major brand"));
+  ck_assert_ptr_null (strstr (text, "sonata"));
+}
+END_TEST
+
+START_TEST (test_extract_video_sound_and_subtitles)
+{
+  char *text;
+
+  if (!have_program ("ffprobe") || !have_program ("ffmpeg"))
+    return;
+  put ("subs.srt", "1\n00:00:00,000 --> 00:00:01,000\nHello\n");
+  shell ("ffmpeg -v quiet -f lavfi -i testsrc=s=320x240:r=1:d=95 -f lavfi "
+         "-i sine=f=440:d=95 -i subs.srt -map 0 -map 1 -map 1 -map 2 "
+         "-c:v mpeg4 -c:a aac -c:s srt film.mkv");
+  text = extract ("film.mkv", "video/x-matroska");
+  /* Two tracks of the same codec are named once, and nothing is said
+     of what is spoken: that goes into the chunks.  */
+  ck_assert_msg (starts_with (text, "Video, 2 minutes long, 320x240, MPEG-4, "
+                              "with AAC sound and subtitles\n"),
+                 "%s", text);
+  ck_assert_ptr_null (strstr (text, "sonata"));
+}
+END_TEST
+
+START_TEST (test_put_duration)
+{
+  static const struct { double s; const char *want; } cases[] = {
+    {0.4, "0 seconds"}, {1, "1 second"}, {59.4, "59 seconds"},
+    {59.6, "1 minute"}, {90, "2 minutes"}, {1335, "22 minutes"},
+    {3600, "1 hour"}, {3660, "1 hour 1 minute"}, {6420, "1 hour 47 minutes"},
+    {7200, "2 hours"}, {9000, "2 hours 30 minutes"},
+  };
+
+  for (size_t i = 0; i < sizeof cases / sizeof *cases; i++)
+    {
+      struct buf b;
+
+      buf_init (&b);
+      put_duration (&b, cases[i].s);
+      ck_assert_str_eq (b.data, cases[i].want);
+      buf_free (&b);
+    }
 }
 END_TEST
 
@@ -724,12 +771,16 @@ words (size_t len, const char *keyword, size_t from, size_t to)
 
 START_TEST (test_chunk_plan)
 {
-  ck_assert_uint_eq (chunk_plan (0, 64), 0);
-  ck_assert_uint_eq (chunk_plan (CHUNK_BYTES, 64), 0);
-  ck_assert_uint_eq (chunk_plan (CHUNK_BYTES + 1, 64), 1);
-  ck_assert_uint_eq (chunk_plan (10 * CHUNK_BYTES, 64), 9);
-  ck_assert_uint_eq (chunk_plan (1000 * CHUNK_BYTES, 64), 64);
-  ck_assert_uint_eq (chunk_plan (1000 * CHUNK_BYTES, 4), 4);
+  ck_assert_uint_eq (chunk_plan (0, 1, 64), 0);
+  ck_assert_uint_eq (chunk_plan (CHUNK_BYTES, 1, 64), 0);
+  ck_assert_uint_eq (chunk_plan (CHUNK_BYTES + 1, 1, 64), 1);
+  ck_assert_uint_eq (chunk_plan (10 * CHUNK_BYTES, 1, 64), 9);
+  ck_assert_uint_eq (chunk_plan (1000 * CHUNK_BYTES, 1, 64), 64);
+  ck_assert_uint_eq (chunk_plan (1000 * CHUNK_BYTES, 1, 4), 4);
+  /* With no window covered by the description, even a short text.  */
+  ck_assert_uint_eq (chunk_plan (0, 0, 4), 0);
+  ck_assert_uint_eq (chunk_plan (10, 0, 4), 1);
+  ck_assert_uint_eq (chunk_plan (2 * CHUNK_BYTES + 1, 0, 4), 3);
 }
 END_TEST
 
@@ -754,7 +805,7 @@ START_TEST (test_chunk_window_on_word_boundaries)
 {
   struct buf b;
   char *text = words (20 * CHUNK_BYTES, "ab", 0, 0);
-  size_t k = chunk_plan (strlen (text), 4);
+  size_t k = chunk_plan (strlen (text), 1, 4);
 
   buf_init (&b);
   buf_puts (&b, text);
@@ -762,13 +813,37 @@ START_TEST (test_chunk_window_on_word_boundaries)
     {
       size_t start, end;
 
-      chunk_window (&b, k, i, &start, &end);
+      chunk_window (&b, k, 1, i, &start, &end);
       ck_assert_uint_ge (start, CHUNK_BYTES);
       ck_assert_uint_le (end, b.len);
       ck_assert_uint_gt (end - start, CHUNK_BYTES / 2);
       ck_assert_uint_le (end - start, CHUNK_BYTES + 200);
       ck_assert (b.data[start - 1] == ' ');
     }
+  buf_free (&b);
+  free (text);
+}
+END_TEST
+
+START_TEST (test_chunk_window_from_start)
+{
+  struct buf b;
+  char *text = words (2 * CHUNK_BYTES + 10, "ab", 0, 0);
+  size_t k = chunk_plan (strlen (text), 0, 4), start, end, covered = 0;
+
+  /* With no window skipped, the chunks cover the whole text.  */
+  ck_assert_uint_eq (k, 3);
+  buf_init (&b);
+  buf_puts (&b, text);
+  for (size_t i = 0; i < k; i++)
+    {
+      chunk_window (&b, k, 0, i, &start, &end);
+      if (start == 0)
+        covered++;
+      ck_assert_uint_le (end, b.len);
+      ck_assert_uint_gt (end, start);
+    }
+  ck_assert_uint_eq (covered, 1);
   buf_free (&b);
   free (text);
 }
@@ -2148,7 +2223,7 @@ fake_transcript (const char *name, size_t *sizes, size_t *n)
 
   truncate (fx.log, 0);
   buf_init (&out);
-  transcribe (sp, p, &out);
+  transcribe (sp, p, &out, MAX_CONTENT);
   speech_close (sp);
   free (p);
   *n = 0;
@@ -2208,10 +2283,19 @@ START_TEST (test_index_speech)
   shell ("ffmpeg -v quiet -f lavfi -i color=blue:s=64x64:d=3 -f lavfi "
          "-i sine=f=440:d=3 -af volume=0.5 -shortest film.mkv");
   ck_assert_int_eq (run_index (NULL), 0);
-  /* The transcript is embedded with the rest of the text, after the
-     tags.  */
-  ck_assert_uint_eq (count_substr (read_file (fx.log), "\nSpeech: sonata\n"),
-                     2);
+  /* The transcript is embedded as a chunk, and not in the description,
+     which says what kind of file it is.  */
+  ck_assert_ptr_nonnull (strstr (read_file (fx.log),
+                                 "From the file talk.ogg:\n\n sonata"));
+  ck_assert_ptr_nonnull (strstr (read_file (fx.log),
+                                 "From the file film.mkv:\n\n sonata"));
+  ck_assert_uint_eq (count_substr (read_file (fx.log), "sonata"), 2);
+  ck_assert_ptr_nonnull (strstr (read_file (fx.log),
+                                 "\n\nAudio recording, 3 seconds long, "));
+  ck_assert_ptr_nonnull (strstr (read_file (fx.log),
+                                 "\n\nVideo, 3 seconds long, 64x64, "));
+  ck_assert_uint_eq (chunks_for ("talk.ogg", "0 1"), 1);
+  ck_assert_uint_eq (chunks_for ("film.mkv", "0 1"), 1);
   ck_assert_int_eq (version_of ("talk.ogg"), VERSION);
   ck_assert_int_eq (version_of ("film.mkv"), VERSION);
   /* The video has its picture as well.  */
@@ -2239,7 +2323,8 @@ START_TEST (test_index_without_speech_model)
                                  "failed 0"));
   ck_assert_int_eq (version_of ("a.ogg"), VERSION);
   ck_assert_int_eq (version_of ("red.png"), VERSION);
-  ck_assert_ptr_null (strstr (read_file (fx.log), "Speech:"));
+  ck_assert_ptr_null (strstr (read_file (fx.log), "sonata"));
+  ck_assert_uint_eq (chunks_for ("a.ogg", "0 0"), 1);
 
   /* Nothing is done again, even once the model is there.  */
   unsetenv ("FAKE_SPEECH");
@@ -2293,6 +2378,8 @@ index_suite (void)
   tcase_add_test (tc, test_extract_image_ocr);
   tcase_add_test (tc, test_extract_audio_tags);
   tcase_add_test (tc, test_extract_video_streams);
+  tcase_add_test (tc, test_extract_video_sound_and_subtitles);
+  tcase_add_test (tc, test_put_duration);
   tcase_add_test (tc, test_extract_docx);
   tcase_add_test (tc, test_extract_epub);
   tcase_add_test (tc, test_extract_odt);
@@ -2370,6 +2457,7 @@ index_suite (void)
   tcase_add_test (tc, test_chunk_plan);
   tcase_add_test (tc, test_chunk_slot_spreads_then_fills);
   tcase_add_test (tc, test_chunk_window_on_word_boundaries);
+  tcase_add_test (tc, test_chunk_window_from_start);
   tcase_add_test (tc, test_index_chunks_long_file);
   tcase_add_test (tc, test_index_chunks_code_fewer);
   tcase_add_test (tc, test_index_chunks_carry_on_next_run);
